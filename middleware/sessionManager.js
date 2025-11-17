@@ -204,15 +204,15 @@ class SessionManager {
       // Set HTTP-only cookies
       res.cookie('accessToken', accessToken, {
         httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
+        secure: true,
+        sameSite: 'none',
         maxAge: this.accessTokenExpiry,
       });
 
       res.cookie('refreshToken', refreshToken, {
         httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
+        secure: true,
+        sameSite: 'none',
         maxAge: this.refreshTokenExpiry
       });
 
@@ -331,8 +331,8 @@ class SessionManager {
       // Set new access token cookie
       res.cookie('accessToken', newAccessToken, {
         httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
+        secure: true,
+        sameSite: 'none',
         maxAge: this.accessTokenExpiry,
       });
 

@@ -122,15 +122,15 @@ app.use((err, req, res, next) => {
   });
 });
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 8000;  // ✅ Change to 8000
 
-app.listen(PORT, () => {
-  console.log(`\n🎯 KhananNetra Backend Server Started!`);
-  console.log(`📍 Port: ${PORT}`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV}`);
-  console.log(`🔗 API URL: http://localhost:${PORT}/api`);
-  console.log(`❤️  Health Check: http://localhost:${PORT}/api/health`);
-  console.log(`👤 Super Admin: superadmin@khanannetra.gov.in / Admin@123`);
-  console.log(`📊 Morgan Logging: ACTIVE`);
-  console.log(`🍪 Cookie Parser: ENABLED\n`); // ✅ Confirm cookie parser
+app.listen(PORT, '0.0.0.0', () => {  // ✅ Add '0.0.0.0' for Docker/Cloud Run
+    console.log(`\n🎯 KhananNetra Backend Server Started!`);
+    console.log(`📍 Port: ${PORT}`);
+    console.log(`🌍 Environment: ${process.env.NODE_ENV}`);
+    console.log(`🔗 API URL: http://0.0.0.0:${PORT}/api`);
+    console.log(`❤️  Health Check: http://0.0.0.0:${PORT}/api/health`);
+    console.log(`👤 Super Admin: superadmin@khanannetra.gov.in / Admin@123`);
+    console.log(`📊 Morgan Logging: ACTIVE`);
+    console.log(`🍪 Cookie Parser: ENABLED\n`);
 });
