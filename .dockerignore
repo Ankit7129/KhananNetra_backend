@@ -1,0 +1,61 @@
+# Dependencies
+node_modules
+npm-debug.log
+
+# OS files
+.DS_Store
+*.swp
+*.swo
+
+# Git
+.git
+.gitignore
+.github
+
+# Environment files (will be set in GCP)
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+dist
+build
+*.pyc
+*.pyo
+*.pyd
+__pycache__
+
+# Python virtual environments
+env/
+venv/
+.Python
+*.egg-info
+
+# Testing
+.pytest_cache
+.coverage
+tests/
+scripts/
+
+# IDE
+.vscode
+.idea
+
+# Logs (will be handled by GCP)
+logs
+*.log
+
+# Documentation (keep only essential)
+*.md
+!README.md
+!INTEGRATION_SETUP.md
+!DOCKER_DEPLOYMENT_GUIDE.md
+
+# Docker files (not needed inside container)
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Unused startup scripts
+start.sh
+start.bat

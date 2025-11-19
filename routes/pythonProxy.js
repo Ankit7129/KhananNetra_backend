@@ -10,8 +10,27 @@ import { protect } from '../middleware/auth.js';
 
 const router = express.Router();
 
-// Python backend URL
-const PYTHON_API_URL = process.env.PYTHON_API_URL || 'http://localhost:8000';
+// Python backend URL - uses environment variable with fallback
+// For local development: http://localhost:8000 (FastAPI default)
+// For Docker: http://python-backend:8001 (service name)
+const getPythonBackendURL = () => {
+  // Explicit environment variable takes precedence
+  if (process.env.PYTHON_BACKEND_URL) {
+    return process.env.PYTHON_BACKEND_URL;
+  }
+  if (process.env.PYTHON_API_URL) {
+    return process.env.PYTHON_API_URL;
+  }
+  
+  // Default based on environment
+  const isDocker = process.env.DOCKER_ENV === 'true' || process.env.NODE_ENV === 'production';
+  return isDocker ? 'http://python-backend:8001' : 'http://localhost:8000';
+};
+
+const PYTHON_API_URL = getPythonBackendURL();
+
+console.log(`🐍 Python Backend URL configured: ${PYTHON_API_URL}`);
+console.log(`🔍 Environment: ${process.env.NODE_ENV || 'development'}`);
 
 /**
  * Health check for Python backend
@@ -261,29 +280,47 @@ router.get('/analysis/:analysisId', protect, async (req, res) => {
     res.status(response.status).json(response.data);
   } catch (error) {
     console.error('❌ Analysis status error:', error.message);
+    console.error('   Python Backend URL:', PYTHON_API_URL);
+    console.error('   Error code:', error.code);
     
     if (error.code === 'ECONNABORTED') {
       console.error('   Timeout - Analysis endpoint took too long to respond');
       res.status(504).json({
         error: 'Gateway timeout',
-        message: 'Analysis status check timed out. The Python backend may be overloaded.'
+        message: 'Analysis status check timed out. The Python backend may be overloaded.',
+        pythonBackendUrl: PYTHON_API_URL
+      });
+    } else if (error.code === 'ECONNREFUSED') {
+      console.error(`   ❌ Connection refused - Python backend not running at ${PYTHON_API_URL}`);
+      res.status(503).json({
+        error: 'Python backend is not running',
+        message: `Failed to connect to Python backend at ${PYTHON_API_URL}. Please ensure:
+          1. Python backend is running (python main.py)
+          2. For local dev: http://localhost:8000 should be accessible
+          3. For Docker: python-backend service should be running
+          4. Firewall/network allows connection`,
+        pythonBackendUrl: PYTHON_API_URL
+      });
+    } else if (error.code === 'ECONNRESET') {
+      console.error('   ❌ Connection reset - Python backend crashed or connection interrupted');
+      res.status(503).json({
+        error: 'Python backend connection reset',
+        message: `Connection to Python backend at ${PYTHON_API_URL} was reset. The backend may have crashed or restarted.`,
+        pythonBackendUrl: PYTHON_API_URL
       });
     } else if (error.response) {
       console.error('   Status:', error.response.status);
       console.error('   Data:', error.response.data);
       res.status(error.response.status).json({
         error: error.response.data.detail || 'Failed to get analysis status',
-        details: error.response.data
-      });
-    } else if (error.code === 'ECONNREFUSED') {
-      res.status(503).json({
-        error: 'Python backend is not running',
-        message: 'Please start the Python backend on port 8000'
+        details: error.response.data,
+        pythonBackendUrl: PYTHON_API_URL
       });
     } else {
       res.status(500).json({
         error: 'Failed to get analysis status',
-        message: error.message
+        message: error.message,
+        pythonBackendUrl: PYTHON_API_URL
       });
     }
   }

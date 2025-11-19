@@ -63,13 +63,34 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'Cookie']
 }));
 
-// Rate limiting
+// Rate limiting - Applied before auth, so it's IP-based
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: 'Too many requests from this IP, please try again later.'
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 1000, // Increased from 100 to 1000 per window
+  message: 'Too many requests from this IP, please try again later.',
+  standardHeaders: true, // Return rate limit info in `RateLimit-*` headers
+  legacyHeaders: false, // Disable `X-RateLimit-*` headers
+  skip: (req) => {
+    // Skip rate limiting for health checks
+    return req.url === '/api/health';
+  }
 });
+
+// Apply rate limiting to all /api routes EXCEPT auth (which has its own limiting)
 app.use('/api', limiter);
+
+// Optional: Stricter rate limiting for auth endpoints to prevent brute force
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // Only 5 attempts per 15 minutes for login/register
+  message: 'Too many login attempts, please try again later.',
+  skipSuccessfulRequests: true, // Don't count successful requests
+  skipFailedRequests: false // Count failed requests
+});
+
+// Apply stricter limiting to auth routes
+app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/register', authLimiter);
 
 // Body parser middleware
 app.use(express.json({ limit: '10mb' }));

@@ -255,9 +255,11 @@ AnalysisHistorySchema.statics.getUserStats = async function(userId) {
         failedAnalyses: {
           $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] }
         },
+        processingAnalyses: {
+          $sum: { $cond: [{ $eq: ['$status', 'processing'] }, 1, 0] }
+        },
         totalDetections: { $sum: '$results.detectionCount' },
-        totalAreaAnalyzed: { $sum: '$aoiArea.km2' },
-        avgDuration: { $avg: '$duration' }
+        averageDuration: { $avg: '$duration' }
       }
     }
   ]);
@@ -266,9 +268,9 @@ AnalysisHistorySchema.statics.getUserStats = async function(userId) {
     totalAnalyses: 0,
     completedAnalyses: 0,
     failedAnalyses: 0,
+    processingAnalyses: 0,
     totalDetections: 0,
-    totalAreaAnalyzed: 0,
-    avgDuration: 0
+    averageDuration: 0
   };
 };
 

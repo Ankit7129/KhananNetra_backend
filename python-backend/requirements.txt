@@ -1,44 +1,48 @@
 # KhananNetra Python Backend Dependencies
-# Integrated with MERN Stack
+# Simplified for production deployment
 
 # FastAPI and Web Framework
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 python-multipart==0.0.9
 
-# Geospatial Processing
-geopandas==1.0.1
+# Basic geospatial (minimal dependencies)
+geopandas==0.14.4
 shapely==2.0.4
-fiona==1.9.6
-rasterio==1.3.10
-pyproj==3.6.1
 folium==0.16.0
 
 # Machine Learning and Data Science
-numpy==1.26.4
-pandas==2.2.2
-scikit-learn==1.4.2
-scikit-image==0.24.0
+numpy==1.24.4
+pandas==2.1.4
+scikit-learn==1.3.2
+
+# Model Download from Kaggle
+kagglehub>=0.2.0
+kaggle>=1.6.0
+scikit-image==0.22.0
 scipy==1.11.4
-tensorflow==2.17.0
-opencv-python-headless==4.10.0.84
+tensorflow==2.15.1
+opencv-python-headless==4.9.0.80
 segmentation-models==1.0.1
 
 # Google Earth Engine (for satellite imagery)
 earthengine-api==0.1.409
 requests==2.31.0
 gdown==5.1.0
-kagglehub
 
 # File Processing
-pillow==10.3.0
+pillow==10.1.0
 
 # Utilities and Configuration
 python-dotenv==1.0.1
-pydantic==2.7.4
-httpx==0.27.0
-aiofiles==24.1.0
+pydantic==2.5.3
+httpx==0.26.0
+aiofiles==23.2.1
+psutil>=5.9.0  # For resource monitoring and stats endpoint
+
+# Performance and stability
+uvloop>=0.19.0  # Faster event loop
 
 # Development
-pytest==8.2.2
+pytest==8.0.2
 pytest-asyncio==0.23.7

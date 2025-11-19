@@ -1,0 +1,829 @@
+"""
+Real-time analysis router with parallel model loading and tile streaming.
+This version loads the model in parallel while fetching and displaying RGB tiles in real-time.
+"""
+
+from fastapi import APIRouter, HTTPException
+from typing import Dict
+import asyncio
+import uuid
+import os
+import tempfile
+import rasterio
+import gc
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+
+from app.models.schemas import AnalysisRequest, AOIGeometry
+from app.services.earth_engine_service import get_earth_engine_service
+from app.services.ml_inference_service import get_ml_service
+from app.services.tile_fetching_service import TileFetchingService
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+# In-memory storage for analysis results - with automatic cleanup
+analysis_results: Dict[str, dict] = {}
+RESULT_RETENTION_HOURS = 24  # Keep results for 24 hours, then auto-cleanup
+
+# Use a dedicated thread pool for analysis to prevent blocking the event loop
+ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="analysis")
+
+def cleanup_analysis_results():
+    """Cleanup old analysis results to prevent memory leaks"""
+    global analysis_results
+    now = datetime.now()
+    expired_ids = []
+    
+    for analysis_id, result in analysis_results.items():
+        try:
+            created_at = result.get("created_at")
+            if created_at:
+                created_time = datetime.fromisoformat(created_at)
+                if now - created_time > timedelta(hours=RESULT_RETENTION_HOURS):
+                    expired_ids.append(analysis_id)
+        except:
+            pass
+    
+    # Remove expired results
+    for analysis_id in expired_ids:
+        try:
+            # Clear large data structures before deletion
+            if "tiles" in analysis_results[analysis_id]:
+                analysis_results[analysis_id]["tiles"] = []
+            del analysis_results[analysis_id]
+            logger.info(f"🧹 Cleaned up old analysis result: {analysis_id}")
+        except:
+            pass
+    
+    # Force garbage collection if we cleaned up anything
+    if expired_ids:
+        gc.collect()
+
+@router.get("/cleanup")
+async def cleanup_endpoint():
+    """Manually trigger cleanup of old analysis results"""
+    cleanup_analysis_results()
+    return {
+        "status": "success",
+        "remaining_analyses": len(analysis_results),
+        "message": "Cleanup completed"
+    }
+
+@router.get("/stats")
+async def get_stats():
+    """Get backend statistics for monitoring"""
+    import psutil
+    import sys
+    
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "memory": {
+            "rss_mb": round(memory_info.rss / 1024 / 1024, 2),
+            "vms_mb": round(memory_info.vms / 1024 / 1024, 2),
+            "percent": process.memory_percent()
+        },
+        "analysis_results_stored": len(analysis_results),
+        "thread_pool_workers": ANALYSIS_EXECUTOR._max_workers
+    }
+
+@router.post("/start")
+async def start_analysis_realtime(request: AnalysisRequest):
+    """Start analysis with real-time tile streaming and parallel model loading"""
+    try:
+        from app.services.geospatial_service import geospatial_service
+        
+        analysis_id = str(uuid.uuid4())
+        
+        # Fetch the AOI using aoi_id
+        aoi = geospatial_service.get_aoi(request.aoi_id)
+        if not aoi:
+            raise HTTPException(status_code=404, detail=f"AOI {request.aoi_id} not found")
+        
+        aoi_geometry = aoi.geometry
+        
+        # Store initial status with creation timestamp
+        analysis_results[analysis_id] = {
+            "status": "processing",
+            "progress": 0,
+            "message": "Initializing analysis...",
+            "current_step": "initialization",
+            "tiles": [],  # Real-time RGB tiles
+            "created_at": datetime.now().isoformat(),  # For auto-cleanup
+            "last_accessed": datetime.now().isoformat()  # Track activity
+        }
+        
+        # Start processing in background thread (not event loop task)
+        # This prevents analysis from blocking the event loop and other requests
+        # Wrap in safety handler to prevent crashes
+        async def safe_process():
+            try:
+                await process_analysis_realtime(analysis_id, aoi_geometry)
+            except Exception as process_error:
+                logger.error(f"❌❌❌ CRITICAL: Analysis {analysis_id} crashed: {process_error}")
+                import traceback
+                traceback.print_exc()
+                # Update status to failed instead of crashing
+                if analysis_id in analysis_results:
+                    analysis_results[analysis_id].update({
+                        "status": "failed",
+                        "message": f"Analysis crashed: {str(process_error)}",
+                        "current_step": "error",
+                        "progress": 0
+                    })
+                # Force cleanup
+                gc.collect()
+        
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(
+            ANALYSIS_EXECUTOR,
+            lambda: asyncio.run(safe_process())
+        )
+        
+        print(f"\n{'='*60}")
+        print(f"🚀 STARTING REAL-TIME ANALYSIS")
+        print(f"Analysis ID: {analysis_id}")
+        print(f"AOI ID: {request.aoi_id}")
+        print(f"AOI Type: {aoi_geometry.type}")
+        print(f"{'='*60}\n")
+        
+        return {
+            "analysis_id": analysis_id,
+            "status": "started",
+            "message": "Analysis started - tiles will stream in real-time"
+        }
+    
+    except Exception as e:
+        print(f"❌ Error starting analysis: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{analysis_id}")
+async def get_analysis_status(analysis_id: str):
+    """
+    Get current analysis status - MUST respond immediately, NO BLOCKING
+    Also tracks last access time and triggers cleanup periodically
+    """
+    # Periodically cleanup old results (every 100 requests)
+    if len(analysis_results) > 0 and len(analysis_results) % 100 == 0:
+        cleanup_analysis_results()
+    
+    # This endpoint MUST be super fast - just a dict lookup
+    if analysis_id not in analysis_results:
+        # Return helpful message instead of generic 404
+        available_ids = list(analysis_results.keys())[:5]
+        raise HTTPException(
+            status_code=404, 
+            detail={
+                "message": "Analysis not found",
+                "analysis_id": analysis_id,
+                "total_active_analyses": len(analysis_results),
+                "available_ids": available_ids,
+                "hint": "Start a new analysis from the frontend by drawing an AOI and clicking 'Analyze'"
+            }
+        )
+    
+    # Update last accessed time for cleanup tracking
+    try:
+        analysis_results[analysis_id]["last_accessed"] = datetime.now().isoformat()
+    except:
+        pass  # Non-critical, ignore errors
+    
+    # Return immediately from dictionary
+    return analysis_results[analysis_id]
+
+
+async def process_analysis_realtime(analysis_id: str, aoi_geometry: AOIGeometry):
+    """Process analysis with real-time tile streaming and parallel model loading"""
+    temp_dir = None
+    model_load_task = None
+    executor = ThreadPoolExecutor(max_workers=1)
+    
+    try:
+        # Step 1: Validate AOI area (5%)
+        print(f"\n{'='*50}")
+        print(f"Step 1: Validating AOI")
+        print(f"{'='*50}")
+        analysis_results[analysis_id].update({
+            "progress": 5,
+            "message": "Validating Area of Interest...",
+            "current_step": "validating"
+        })
+        
+        # Initialize EE early for area calculation
+        import ee
+        try:
+            ee.Initialize(project='mining-detection')
+            print(f"   ✅ Earth Engine initialized for validation")
+        except Exception as ee_error:
+            print(f"   ℹ️  EE already initialized")
+        
+        # Calculate area
+        try:
+            geometry_dict = {
+                'type': aoi_geometry.type,
+                'coordinates': aoi_geometry.coordinates
+            }
+            
+            if aoi_geometry.type == 'Polygon':
+                ee_coords = [[(x, y) for x, y, *_ in ring] for ring in aoi_geometry.coordinates]
+                temp_geom = ee.Geometry.Polygon(ee_coords)
+            else:
+                temp_geom = ee.Geometry.Polygon(aoi_geometry.coordinates[0])
+            
+            area_m2 = temp_geom.area().getInfo()
+            area_km2 = area_m2 / 1_000_000
+            
+            print(f"   📏 AOI area: {area_km2:.2f} km²")
+            
+            if area_km2 > 200:
+                raise ValueError(f"AOI too large ({area_km2:.1f} km²). Max: 200 km²")
+            elif area_km2 > 100:
+                print(f"   ⚠️  Large area - may take 20-30 minutes")
+            
+            analysis_results[analysis_id]["area_km2"] = round(area_km2, 2)
+            
+        except ValueError:
+            raise
+        except Exception as e:
+            print(f"   ⚠️  Could not calculate area: {e}")
+        
+        print(f"✅ AOI validated")
+        
+        # Step 2: Initialize services (10%)
+        print(f"\n{'='*50}")
+        print(f"Step 2: Initializing services")
+        print(f"{'='*50}")
+        analysis_results[analysis_id].update({
+            "progress": 10,
+            "message": "Connecting to Google Earth Engine...",
+            "current_step": "connecting"
+        })
+        
+        # Earth Engine is initialized at startup - just get the service
+        ee_service = get_earth_engine_service()
+        tile_service = TileFetchingService(ee_service)
+        print(f"✅ Services ready")
+        
+        # Step 3: Calculate tile grid (15%)
+        print(f"\n{'='*50}")
+        print(f"Step 3: Calculating tile grid")
+        print(f"{'='*50}")
+        analysis_results[analysis_id].update({
+            "progress": 15,
+            "message": "Calculating optimal tile grid...",
+            "current_step": "requesting"
+        })
+        
+        tiles = await asyncio.to_thread(tile_service.calculate_tile_grid, geometry_dict)
+        print(f"✅ Tile grid: {len(tiles)} tiles")
+        
+        # CRITICAL: Adaptive tile limit based on available system memory
+        # Can process up to 25 tiles with aggressive memory management
+        MAX_TILES = 25  # Increased from 12 - system is robust now with 7-layer defense
+        if len(tiles) > MAX_TILES:
+            print(f"⚠️  Warning: {len(tiles)} tiles requested, limiting to {MAX_TILES} for stability")
+            tiles = tiles[:MAX_TILES]
+            print(f"   📌 Processing first {len(tiles)} tiles only (can increase if needed)")
+        
+        # Update progress: Grid calculated (18%)
+        analysis_results[analysis_id].update({
+            "progress": 18,
+            "message": f"Grid calculated: {len(tiles)} tiles to process",
+            "current_step": "requesting", 
+            "total_tiles": len(tiles)
+        })
+        
+        # Step 4: Fetch tiles in REAL-TIME (20% - 65%)
+        print(f"\n{'='*50}")
+        print(f"Step 4: Fetching satellite imagery tiles in REAL-TIME")
+        print(f"{'='*50}")
+        analysis_results[analysis_id].update({
+            "progress": 20,
+            "message": f"Fetching satellite tiles...",
+            "current_step": "preprocessing",
+            "total_tiles": len(tiles),
+            "tiles_fetched": 0
+        })
+        
+        def tile_callback(callback_data):
+            """Callback to update progress as each tile is fetched"""
+            tile_info = callback_data['tile']
+            current = callback_data['current']
+            total = callback_data['total']
+            
+            progress = 20 + int((current / total) * 45)  # 20% to 65%
+            
+            # Add tile to results immediately (even if failed)
+            tile_to_add = {
+                "tile_id": tile_info.get("tile_id", tile_info.get("id")),
+                "bounds": tile_info.get("bounds", []),
+                "image_base64": tile_info.get("image_base64", None),
+                "row": tile_info.get("row", 0),
+                "col": tile_info.get("col", 0),
+                "status": tile_info.get("status", "unknown"),
+                "error": tile_info.get("error", None),
+                "bands_used": tile_info.get("bands", ['B2', 'B3', 'B4', 'B8', 'B11', 'B12']),
+                "cloud_coverage": 0,  # TODO: Get from tile_info if available
+                "timestamp": tile_info.get("timestamp", "")
+            }
+            
+            # Debug: Log what we're adding
+            print(f"   🔍 DEBUG: Adding tile with bounds: {tile_to_add['bounds'][:2] if tile_to_add['bounds'] else 'None'}")
+            print(f"   🔍 DEBUG: Has image: {tile_to_add['image_base64'] is not None}")
+            
+            analysis_results[analysis_id]["tiles"].append(tile_to_add)
+            
+            analysis_results[analysis_id].update({
+                "progress": progress,
+                "message": f"Fetching tile {current}/{total}...",
+                "current_step": "preprocessing",
+                "total_tiles": total,
+                "tiles_fetched": current
+            })
+            
+            print(f"   ✅ Tile {current}/{total} fetched (Row {tile_info['row']}, Col {tile_info['col']})")
+            print(f"   🔍 DEBUG: Total tiles in results now: {len(analysis_results[analysis_id]['tiles'])}")
+        
+        # Fetch all tiles with real-time updates
+        print(f"   📡 Starting real-time tile download...")
+        
+        # Update progress: Starting tile fetch (20%)
+        analysis_results[analysis_id].update({
+            "progress": 20,
+            "message": "Starting satellite tile download...",
+            "current_step": "preprocessing"
+        })
+        
+        all_tiles = await asyncio.to_thread(
+            tile_service.fetch_all_tiles_realtime,
+            geometry_dict,
+            tiles,
+            callback=tile_callback
+        )
+        
+        # Update progress: All tiles fetched (65%)
+        analysis_results[analysis_id].update({
+            "progress": 65,
+            "message": f"✅ All {len(all_tiles)} tiles fetched!",
+            "current_step": "preprocessing"
+        })
+        
+        print(f"✅ All {len(all_tiles)} RGB tiles fetched and displayed!")
+        
+        # Step 5: Get ML service instance (70%)
+        print(f"\n{'='*50}")
+        print(f"Step 5: Initializing ML service")
+        print(f"{'='*50}")
+        analysis_results[analysis_id].update({
+            "progress": 70,
+            "message": "Preparing ML inference engine...",
+            "current_step": "processing"
+        })
+        
+        # Get ML service instance (should be fast since ML model loads in subprocess)
+        print(f"   🔍 Getting ML service instance...")
+        ml_service = get_ml_service()
+        print(f"   ✅ ML service ready (inference will run in subprocess)")
+        
+        # Update progress: Service ready (76%)
+        analysis_results[analysis_id].update({
+            "progress": 76,
+            "message": "ML service ready - starting analysis...",
+            "current_step": "processing"
+        })
+        
+        # Step 6: Run ML inference on 6-band tiles (80%)
+        print(f"\n{'='*50}")
+        print(f"Step 6: Running ML inference on tiles")
+        print(f"{'='*50}")
+        analysis_results[analysis_id].update({
+            "progress": 80,
+            "message": "🔬 Running AI analysis on satellite tiles...",
+            "current_step": "ml_inference_tiles"
+        })
+        
+        # Get the 6-band tile data we already fetched
+        print(f"   🔍 DEBUG: Getting 6-band tile data from service...")
+        tile_6band_data = await asyncio.to_thread(tile_service.get_6band_tile_data)
+        
+        print(f"   🔍 DEBUG: Checking 6-band tile data availability...")
+        print(f"   📊 DEBUG: Found {len(tile_6band_data)} tiles with 6-band data")
+        
+        # Debug: Show first tile info if available
+        if len(tile_6band_data) > 0:
+            first_tile = tile_6band_data[0]
+            print(f"   🔍 DEBUG: First tile info:")
+            print(f"      - Tile ID: {first_tile.get('tile_id', 'Unknown')}")
+            print(f"      - Has data: {'data' in first_tile}")
+            if 'data' in first_tile and hasattr(first_tile['data'], 'shape'):
+                print(f"      - Data shape: {first_tile['data'].shape}")
+            print(f"      - Keys: {list(first_tile.keys())}")
+        
+        if len(tile_6band_data) == 0:
+            print(f"   ❌ DEBUG: No 6-band tile data available for ML inference")
+            analysis_results[analysis_id].update({
+                "status": "error",
+                "progress": 80,
+                "message": "❌ No satellite data available for AI analysis",
+                "current_step": "error"
+            })
+            raise ValueError("No 6-band tile data available for ML inference")
+        
+        print(f"   🎯 Running inference on {len(tile_6band_data)} tiles using subprocess...")
+        
+        # Update progress: Starting AI analysis
+        analysis_results[analysis_id].update({
+            "progress": 82,
+            "message": f"🤖 Starting AI analysis on {len(tile_6band_data)} tiles...",
+            "current_step": "ml_inference_tiles"
+        })
+        
+        # Import dependencies
+        import numpy as np
+        
+        # Run inference on each tile using subprocess
+        tile_predictions = []
+        for idx, tile_data in enumerate(tile_6band_data, 1):
+            try:
+                # Force garbage collection BEFORE processing each tile
+                gc.collect()
+                
+                # Update ML progress
+                ml_progress_percent = 70 + int((idx / len(tile_6band_data)) * 18)  # 70% to 88%
+                analysis_results[analysis_id].update({
+                    "progress": ml_progress_percent,
+                    "message": f"Analyzing tile {idx}/{len(tile_6band_data)} with deep learning...",
+                    "current_step": "processing",
+                    "ml_progress": {
+                        "current": idx - 1,  # Completed tiles
+                        "total": len(tile_6band_data),
+                        "currentTileId": str(tile_data.get('tile_id', idx))
+                    }
+                })
+                
+                print(f"   🔮 Processing tile {idx}/{len(tile_6band_data)}")
+                
+                # Get 6-band array
+                six_band_array = tile_data['data']
+                print(f"      Shape: {six_band_array.shape}")
+                print(f"      Data type: {six_band_array.dtype}")
+                print(f"      Value range: [{six_band_array.min():.3f}, {six_band_array.max():.3f}]")
+                
+                # Validate 6-band input
+                if len(six_band_array.shape) != 3 or six_band_array.shape[2] != 6:
+                    print(f"      ⚠️  Invalid shape - expected (H,W,6), got {six_band_array.shape}")
+                    continue
+                
+                # Run prediction via subprocess (handles resizing and preprocessing internally)
+                print(f"      🧠 Running ML prediction via subprocess...")
+                inference_input = {
+                    'image_data': six_band_array,
+                    'tile_index': idx,
+                    'tile_id': str(idx),  # Tile identifier for unique block IDs
+                    'analysis_id': analysis_id,  # Analysis identifier for unique block IDs
+                    'bounds': tile_data.get('bounds'),  # Pass geographic bounds for proper coordinate transform
+                    'transform': tile_data.get('transform'),  # Pass exact rasterio transform from tile
+                    'crs': tile_data.get('crs', 'EPSG:4326'),  # Pass exact CRS
+                    'exact_shape': tile_data.get('exact_shape')  # Pass exact dimensions [H, W]
+                }
+                
+                result = await asyncio.to_thread(ml_service.run_inference_on_tile, inference_input)
+                
+                if not result.get('success', False):
+                    print(f"      ❌ Inference failed: {result.get('error', 'Unknown error')}")
+                    continue
+                
+                # Extract results with better metrics
+                mining_pixels = result.get('mining_pixels', 0)
+                total_pixels = result.get('total_pixels', 1)
+                mining_percentage = result.get('mining_percentage', 0.0)
+                confidence = result.get('confidence', 0.0) / 100.0  # Convert to 0-1 range
+                max_pred = result.get('max_prediction', 0.0)
+                mean_pred = result.get('mean_prediction', 0.0)
+                mine_blocks = result.get('mine_blocks', [])  # Get detected mine block polygons
+                num_mine_blocks = result.get('num_mine_blocks', 0)
+                total_area_m2 = result.get('total_area_m2', None)  # Get total area in square meters
+                mask_shape = result.get('mask_shape', [512, 512])  # Get actual mask dimensions [H, W]
+                prob_map_base64 = result.get('probability_map_base64', None)  # Get raw prediction heatmap
+                
+                # Consider it mining if there are any detected pixels
+                mining_detected = mining_pixels > 0
+                
+                print(f"      ✅ Prediction complete")
+                print(f"      📊 Mining pixels: {mining_pixels}/{total_pixels}")
+                print(f"      📊 Mining coverage: {mining_percentage:.1f}%")
+                print(f"      📊 Mine blocks detected: {num_mine_blocks}")
+                print(f"      📊 Mask dimensions: {mask_shape[0]}×{mask_shape[1]}")
+                if total_area_m2:
+                    print(f"      📊 Total mine area: {total_area_m2/1e6:.4f} km²")
+                print(f"      📊 Confidence: {confidence * 100:.1f}%")
+                print(f"      📊 Max prediction: {max_pred:.3f}")
+                print(f"      📊 Mean prediction: {mean_pred:.3f}")
+                if prob_map_base64:
+                    print(f"      📊 Probability map: Generated ({len(prob_map_base64)} chars)")
+                else:
+                    print(f"      ⚠️  Probability map: Missing from subprocess result")
+                
+                # Store prediction result
+                tile_predictions.append({
+                    'tile_id': tile_data['tile_id'],
+                    'mining_detected': mining_detected,
+                    'mining_percentage': mining_percentage,
+                    'mining_pixels': mining_pixels,
+                    'bounds': tile_data['bounds'],
+                    'confidence': max(confidence, max_pred),  # Use higher of avg or max
+                    'mine_blocks': mine_blocks,  # Add polygon data
+                    'num_mine_blocks': num_mine_blocks,
+                    'total_area_m2': total_area_m2,  # Add total area in square meters
+                    'mask_shape': mask_shape,  # Add actual mask dimensions for pixel-perfect alignment
+                    'probability_map_base64': prob_map_base64  # Add raw prediction heatmap
+                })
+                
+                # Update the corresponding tile in analysis_results with ML results
+                for tile_idx, result_tile in enumerate(analysis_results[analysis_id]["tiles"]):
+                    if result_tile["tile_id"] == tile_data['tile_id']:
+                        analysis_results[analysis_id]["tiles"][tile_idx].update({
+                            'mining_detected': mining_detected,
+                            'mining_percentage': mining_percentage,
+                            'confidence': max(confidence, max_pred),
+                            'mine_blocks': mine_blocks,  # Add mine block polygons
+                            'num_mine_blocks': num_mine_blocks,  # Add count
+                            'total_area_m2': total_area_m2,  # Add total area
+                            'mask_shape': mask_shape,  # Add actual dimensions [H, W]
+                            'probability_map_base64': prob_map_base64  # Add raw prediction heatmap
+                        })
+                        if prob_map_base64:
+                            print(f"      ✅ Probability map added to tile {tile_data['tile_id']}")
+                        else:
+                            print(f"      ❌ Probability map missing for tile {tile_data['tile_id']}")
+                        break
+                
+                print(f"      ✅ Tile {idx} analyzed - detected: {mining_detected}, pixels: {mining_pixels}")
+                
+            except Exception as tile_error:
+                print(f"      ⚠️  Failed to process tile {idx}: {tile_error}")
+                import traceback
+                traceback.print_exc()
+                # Continue processing instead of crashing
+                continue
+            finally:
+                # CRITICAL: Clean up in finally block with safety checks
+                try:
+                    if 'six_band_array' in locals():
+                        del six_band_array
+                    if 'result' in locals():
+                        del result
+                    # ALWAYS force garbage collection after each tile
+                    gc.collect()
+                    if idx % 2 == 0:
+                        print(f"      🧹 Memory cleanup performed")
+                    # Reduced delay for faster processing (50ms instead of 100ms)
+                    # Still provides enough time for system stability
+                    import time
+                    time.sleep(0.05)  # 50ms pause between tiles - optimized for speed
+                except:
+                    pass  # Ignore cleanup errors
+        
+        print(f"✅ ML inference complete on {len(tile_predictions)} tiles")
+        
+        # Update final ML progress (save length before cleanup)
+        total_tiles_processed = len(tile_6band_data) if 'tile_6band_data' in locals() else len(tile_predictions)
+        analysis_results[analysis_id].update({
+            "ml_progress": {
+                "current": total_tiles_processed,
+                "total": total_tiles_processed,
+                "currentTileId": None
+            }
+        })
+        
+        # Clean up tile data after inference and after using it
+        try:
+            if 'tile_6band_data' in locals():
+                del tile_6band_data
+            gc.collect()
+            print(f"   🧹 Cleaned up tile data arrays")
+        except Exception as cleanup_error:
+            print(f"   ⚠️  Cleanup warning: {cleanup_error}")
+        
+        # Step 7: Post-process and extract detections (88%)
+        print(f"\n{'='*50}")
+        print(f"Step 7: Extracting mining locations from tiles")
+        print(f"{'='*50}")
+        analysis_results[analysis_id].update({
+            "progress": 88,
+            "message": "🔧 Extracting mining locations...",
+            "current_step": "extract_detections"
+        })
+        
+        # Extract detections from each tile
+        import numpy as np
+        
+        detections = []
+        detection_id = 1
+        
+        for tile_pred in tile_predictions:
+            if tile_pred['confidence'] < 0.3:
+                # Skip tiles with low confidence
+                continue
+            
+            # Get tile bounds [[min_lon, min_lat], [max_lon, max_lat], ...]
+            bounds = tile_pred['bounds']
+            min_lon = min([b[0] for b in bounds])
+            max_lon = max([b[0] for b in bounds])
+            min_lat = min([b[1] for b in bounds])
+            max_lat = max([b[1] for b in bounds])
+            
+            # Calculate center of tile
+            center_lon = (min_lon + max_lon) / 2
+            center_lat = (min_lat + max_lat) / 2
+            
+            # Calculate tile area in m²
+            # Approximate: 1 degree ≈ 111 km at equator
+            width_km = (max_lon - min_lon) * 111 * np.cos(np.radians(center_lat))
+            height_km = (max_lat - min_lat) * 111
+            area_m2 = int(width_km * height_km * 1_000_000)
+            
+            detections.append({
+                "id": detection_id,
+                "latitude": center_lat,
+                "longitude": center_lon,
+                "confidence": tile_pred['confidence'],
+                "tile_id": tile_pred['tile_id'],
+                "area_m2": area_m2,
+                "bounds": bounds
+            })
+            
+            detection_id += 1
+        
+        print(f"✅ Found {len(detections)} potential mining areas across {len(tile_predictions)} tiles")
+        
+        # Step 8: Merge adjacent polygons across tiles (95%)
+        print(f"\n{'='*50}")
+        print(f"Step 8: Merging adjacent mine blocks across tiles")
+        print(f"{'='*50}")
+        analysis_results[analysis_id].update({
+            "progress": 95,
+            "message": "🔗 Merging adjacent mine blocks...",
+            "current_step": "merge_polygons"
+        })
+        
+        # Automatically merge adjacent polygons to eliminate tile boundary artifacts
+        merged_blocks_geojson = None
+        try:
+            from app.utils.merge_polygons import merge_adjacent_mine_blocks
+            
+            # Only merge if we have tiles with mine blocks
+            tiles_with_blocks = [t for t in analysis_results[analysis_id]["tiles"] if t.get('mine_blocks')]
+            
+            if tiles_with_blocks:
+                print(f"🔗 Merging polygons from {len(tiles_with_blocks)} tiles with detections...")
+                merged_blocks_geojson = merge_adjacent_mine_blocks(tiles_with_blocks, analysis_id=analysis_id)
+                
+                merged_count = merged_blocks_geojson['metadata']['merged_block_count']
+                original_count = merged_blocks_geojson['metadata']['original_block_count']
+                total_area_ha = merged_blocks_geojson['metadata']['total_area_m2'] / 10000
+                
+                print(f"✅ Merged {original_count} blocks → {merged_count} unified blocks")
+                print(f"✅ Total mining area: {total_area_ha:.2f} hectares")
+                
+                # Store merged blocks in analysis results
+                analysis_results[analysis_id]["merged_blocks"] = merged_blocks_geojson
+                analysis_results[analysis_id]["merged_block_count"] = merged_count
+                analysis_results[analysis_id]["total_mining_area_ha"] = total_area_ha
+            else:
+                print("📋 No mine blocks to merge")
+                
+        except Exception as merge_error:
+            print(f"⚠️  Polygon merging failed: {merge_error}")
+            # Continue without merging - individual tile polygons will be used
+        
+        # Step 9: Complete (100%)
+        print(f"\n{'='*50}")
+        print(f"Step 9: Analysis complete!")
+        print(f"{'='*50}")
+        
+        analysis_results[analysis_id].update({
+            "status": "completed",
+            "progress": 100,
+            "message": "✅ Analysis complete!",
+            "current_step": "complete",
+            "detections": detections,
+            "detection_count": len(detections)
+        })
+        
+        print(f"✅✅✅ Analysis {analysis_id} completed successfully!")
+        print(f"   Total tiles displayed: {len(all_tiles)}")
+        print(f"   Mining areas detected: {len(detections)}")
+        
+    except Exception as e:
+        print(f"❌ Analysis {analysis_id} failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        analysis_results[analysis_id].update({
+            "status": "failed",
+            "message": f"❌ Error: {str(e)}",
+            "current_step": "error"
+        })
+    
+    finally:
+        # Comprehensive cleanup to prevent resource leaks
+        logger.info(f"🧹 Starting cleanup for analysis {analysis_id}")
+        
+        try:
+            # Cleanup temporary directory
+            if temp_dir and os.path.exists(temp_dir):
+                import shutil
+                try:
+                    shutil.rmtree(temp_dir)
+                    logger.info(f"   ✅ Temporary directory cleaned")
+                except Exception as cleanup_err:
+                    logger.warning(f"   ⚠️  Could not remove temp dir: {cleanup_err}")
+            
+            # Shutdown executor properly to release threads
+            if executor:
+                executor.shutdown(wait=True)
+                logger.info(f"   ✅ Thread executor shutdown")
+            
+            # Clear tile data from memory (keep metadata for results page)
+            if analysis_id in analysis_results:
+                try:
+                    # Keep results but clear large tile images to save memory
+                    if "tiles" in analysis_results[analysis_id]:
+                        tiles = analysis_results[analysis_id]["tiles"]
+                        for tile in tiles:
+                            # Clear large base64 images but keep everything else
+                            if "image_base64" in tile and tile["image_base64"]:
+                                tile["image_base64"] = None  # Clear to save memory
+                            # Keep probability maps (smaller) for visualization
+                    logger.info(f"   ✅ Large tile images cleared from memory ({len(tiles)} tiles)")
+                except Exception as clear_err:
+                    logger.warning(f"   ⚠️  Error clearing tile data: {clear_err}")
+            
+            # Force garbage collection
+            gc.collect()
+            logger.info(f"   ✅ Garbage collection triggered")
+            
+        except Exception as final_cleanup_err:
+            logger.error(f"   ❌ Error during final cleanup: {final_cleanup_err}")
+        
+        logger.info(f"🧹 Cleanup completed for analysis {analysis_id}")
+
+
+@router.post("/merge-polygons/{analysis_id}")
+async def merge_mine_block_polygons(analysis_id: str):
+    """
+    Merge adjacent mine block polygons across tiles.
+    This creates unified polygons for mining operations that span multiple tiles.
+    """
+    try:
+        from app.utils.merge_polygons import merge_adjacent_mine_blocks
+        
+        # Get analysis results
+        if analysis_id not in analysis_results:
+            raise HTTPException(status_code=404, detail=f"Analysis {analysis_id} not found")
+        
+        result = analysis_results[analysis_id]
+        
+        if result.get("status") != "completed":
+            raise HTTPException(status_code=400, detail="Analysis not completed yet")
+        
+        tiles = result.get("tiles", [])
+        if not tiles:
+            raise HTTPException(status_code=400, detail="No tiles found in analysis")
+        
+        print(f"\n🔄 Merging polygons for analysis {analysis_id}")
+        print(f"Processing {len(tiles)} tiles...")
+        
+        # Merge adjacent mine blocks
+        merged_geojson = merge_adjacent_mine_blocks(tiles)
+        
+        print(f"✅ Merged into {merged_geojson['metadata']['merged_block_count']} blocks")
+        print(f"   (from {merged_geojson['metadata']['original_block_count']} original blocks)")
+        
+        return {
+            "analysis_id": analysis_id,
+            "merged_blocks": merged_geojson,
+            "summary": {
+                "original_blocks": merged_geojson['metadata']['original_block_count'],
+                "merged_blocks": merged_geojson['metadata']['merged_block_count'],
+                "total_area_ha": merged_geojson['metadata']['total_area_m2'] / 10000,
+                "tiles_processed": merged_geojson['metadata']['tiles_processed']
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error merging polygons: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error merging polygons: {str(e)}")
