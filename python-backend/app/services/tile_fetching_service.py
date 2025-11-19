@@ -259,7 +259,7 @@ class TileFetchingService:
                 # Continue anyway with RGB preview
             
             # Add fields expected by frontend
-            tile_info['tile_id'] = tile_info['id']
+            tile_info['tile_id'] = str(tile_info['id'])
             tile_info['image_base64'] = img_base64  # RGB preview
             tile_info['status'] = 'fetched'
             tile_info['bands'] = ml_bands
@@ -328,9 +328,14 @@ class TileFetchingService:
                     # Store 6-band data if available
                     if six_band_array is not None:
                         tile_6band_data.append({
-                            'tile_id': tile_info['id'],
+                            'tile_id': str(tile_info['id']),
                             'data': six_band_array,
-                            'bounds': tile_info['bounds']
+                            'bounds': tile_info['bounds'],
+                            'row': tile_info.get('row'),
+                            'col': tile_info.get('col'),
+                            'transform': tile_info.get('transform'),
+                            'crs': tile_info.get('crs', 'EPSG:4326'),
+                            'exact_shape': tile_info.get('exact_shape')
                         })
                 
                     progress = (idx / len(tiles)) * 100

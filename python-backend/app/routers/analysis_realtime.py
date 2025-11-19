@@ -4,7 +4,7 @@ This version loads the model in parallel while fetching and displaying RGB tiles
 """
 
 from fastapi import APIRouter, HTTPException
-from typing import Dict
+from typing import Dict, List, Tuple
 import asyncio
 import uuid
 import os
@@ -14,6 +14,11 @@ import gc
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+import numpy as np
+
+from rasterio.io import MemoryFile
+from rasterio.merge import merge
+from rasterio.transform import array_bounds, from_bounds
 
 from app.models.schemas import AnalysisRequest, AOIGeometry
 from app.services.earth_engine_service import get_earth_engine_service
@@ -26,6 +31,96 @@ logger = logging.getLogger(__name__)
 # In-memory storage for analysis results - with automatic cleanup
 analysis_results: Dict[str, dict] = {}
 RESULT_RETENTION_HOURS = 24  # Keep results for 24 hours, then auto-cleanup
+def _ensure_tile_transform(tile: dict) -> Tuple[np.ndarray, object, str]:
+    """Ensure each tile has transform and CRS for mosaicking."""
+    data = tile.get("data")
+    if data is None:
+        raise ValueError("Tile is missing data array for mosaicking")
+
+    transform = tile.get("transform")
+    crs = tile.get("crs") or "EPSG:4326"
+
+    if transform is None:
+        bounds = tile.get("bounds")
+        if not bounds or len(bounds) < 4:
+            raise ValueError("Tile is missing bounds required to derive transform")
+
+        min_lon = min(pt[0] for pt in bounds)
+        max_lon = max(pt[0] for pt in bounds)
+        min_lat = min(pt[1] for pt in bounds)
+        max_lat = max(pt[1] for pt in bounds)
+        height, width = data.shape[0], data.shape[1]
+        transform = from_bounds(min_lon, min_lat, max_lon, max_lat, width, height)
+
+    return data, transform, crs
+
+
+def build_mosaic_from_tiles(tile_data_list: List[dict]) -> Tuple[np.ndarray, object, str, List[List[float]]]:
+    """Merge individual tile arrays into a single georeferenced mosaic."""
+    if not tile_data_list:
+        raise ValueError("No tile data available to build mosaic")
+
+    datasets = []
+    memfiles = []
+
+    try:
+        target_crs = None
+
+        for tile in tile_data_list:
+            if tile.get("data") is None:
+                continue
+
+            data, transform, crs = _ensure_tile_transform(tile)
+            if target_crs is None:
+                target_crs = crs
+
+            height, width, bands = data.shape
+            mem = MemoryFile()
+            dataset = mem.open(
+                driver="GTiff",
+                height=height,
+                width=width,
+                count=bands,
+                dtype=data.dtype,
+                transform=transform,
+                crs=crs
+            )
+            dataset.write(np.moveaxis(data, -1, 0))
+            datasets.append(dataset)
+            memfiles.append(mem)
+
+        if not datasets:
+            raise ValueError("Tile dataset list is empty after filtering missing data")
+
+        mosaic_data, mosaic_transform = merge(datasets, method="first")
+        mosaic_array = np.moveaxis(mosaic_data, 0, -1).astype(np.float32, copy=False)
+
+        first_dataset = datasets[0]
+        mosaic_crs = first_dataset.crs.to_string() if first_dataset.crs else (target_crs or "EPSG:4326")
+
+        height, width = mosaic_array.shape[0], mosaic_array.shape[1]
+        min_x, min_y, max_x, max_y = array_bounds(height, width, mosaic_transform)
+        mosaic_bounds = [
+            [float(min_x), float(min_y)],
+            [float(max_x), float(min_y)],
+            [float(max_x), float(max_y)],
+            [float(min_x), float(max_y)],
+            [float(min_x), float(min_y)]
+        ]
+
+        return mosaic_array, mosaic_transform, mosaic_crs, mosaic_bounds
+
+    finally:
+        for dataset in datasets:
+            try:
+                dataset.close()
+            except Exception:
+                pass
+        for mem in memfiles:
+            try:
+                mem.close()
+            except Exception:
+                pass
 
 # Use a dedicated thread pool for analysis to prevent blocking the event loop
 ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="analysis")
@@ -400,33 +495,20 @@ async def process_analysis_realtime(analysis_id: str, aoi_geometry: AOIGeometry)
             "current_step": "processing"
         })
         
-        # Step 6: Run ML inference on 6-band tiles (80%)
+        # Step 6: Run ML inference on unified mosaic (80%)
         print(f"\n{'='*50}")
-        print(f"Step 6: Running ML inference on tiles")
+        print(f"Step 6: Running ML inference on unified mosaic")
         print(f"{'='*50}")
         analysis_results[analysis_id].update({
             "progress": 80,
-            "message": "🔬 Running AI analysis on satellite tiles...",
+            "message": "🔬 Assembling satellite mosaic for AI analysis...",
             "current_step": "ml_inference_tiles"
         })
-        
-        # Get the 6-band tile data we already fetched
-        print(f"   🔍 DEBUG: Getting 6-band tile data from service...")
+
+        print(f"   🔍 DEBUG: Fetching cached 6-band tile data for mosaicking...")
         tile_6band_data = await asyncio.to_thread(tile_service.get_6band_tile_data)
-        
-        print(f"   🔍 DEBUG: Checking 6-band tile data availability...")
-        print(f"   📊 DEBUG: Found {len(tile_6band_data)} tiles with 6-band data")
-        
-        # Debug: Show first tile info if available
-        if len(tile_6band_data) > 0:
-            first_tile = tile_6band_data[0]
-            print(f"   🔍 DEBUG: First tile info:")
-            print(f"      - Tile ID: {first_tile.get('tile_id', 'Unknown')}")
-            print(f"      - Has data: {'data' in first_tile}")
-            if 'data' in first_tile and hasattr(first_tile['data'], 'shape'):
-                print(f"      - Data shape: {first_tile['data'].shape}")
-            print(f"      - Keys: {list(first_tile.keys())}")
-        
+        print(f"    DEBUG: Found {len(tile_6band_data)} tiles with 6-band data")
+
         if len(tile_6band_data) == 0:
             print(f"   ❌ DEBUG: No 6-band tile data available for ML inference")
             analysis_results[analysis_id].update({
@@ -436,163 +518,139 @@ async def process_analysis_realtime(analysis_id: str, aoi_geometry: AOIGeometry)
                 "current_step": "error"
             })
             raise ValueError("No 6-band tile data available for ML inference")
-        
-        print(f"   🎯 Running inference on {len(tile_6band_data)} tiles using subprocess...")
-        
-        # Update progress: Starting AI analysis
+
+        # Build geospatially aligned mosaic before inference
+        try:
+            mosaic_array, mosaic_transform, mosaic_crs, mosaic_bounds = await asyncio.to_thread(
+                build_mosaic_from_tiles,
+                tile_6band_data
+            )
+        except Exception as mosaic_error:
+            print(f"   ❌ Failed to build mosaic: {mosaic_error}")
+            analysis_results[analysis_id].update({
+                "status": "error",
+                "progress": 80,
+                "message": "❌ Could not assemble satellite mosaic for analysis",
+                "current_step": "error"
+            })
+            raise
+
+        print(f"   ✅ Mosaic assembled with shape {mosaic_array.shape} and CRS {mosaic_crs}")
+
         analysis_results[analysis_id].update({
             "progress": 82,
-            "message": f"🤖 Starting AI analysis on {len(tile_6band_data)} tiles...",
-            "current_step": "ml_inference_tiles"
+            "message": "🤖 Running AI analysis on merged mosaic...",
+            "current_step": "processing"
         })
-        
-        # Import dependencies
-        import numpy as np
-        
-        # Run inference on each tile using subprocess
-        tile_predictions = []
-        for idx, tile_data in enumerate(tile_6band_data, 1):
-            try:
-                # Force garbage collection BEFORE processing each tile
-                gc.collect()
-                
-                # Update ML progress
-                ml_progress_percent = 70 + int((idx / len(tile_6band_data)) * 18)  # 70% to 88%
-                analysis_results[analysis_id].update({
-                    "progress": ml_progress_percent,
-                    "message": f"Analyzing tile {idx}/{len(tile_6band_data)} with deep learning...",
-                    "current_step": "processing",
-                    "ml_progress": {
-                        "current": idx - 1,  # Completed tiles
-                        "total": len(tile_6band_data),
-                        "currentTileId": str(tile_data.get('tile_id', idx))
-                    }
-                })
-                
-                print(f"   🔮 Processing tile {idx}/{len(tile_6band_data)}")
-                
-                # Get 6-band array
-                six_band_array = tile_data['data']
-                print(f"      Shape: {six_band_array.shape}")
-                print(f"      Data type: {six_band_array.dtype}")
-                print(f"      Value range: [{six_band_array.min():.3f}, {six_band_array.max():.3f}]")
-                
-                # Validate 6-band input
-                if len(six_band_array.shape) != 3 or six_band_array.shape[2] != 6:
-                    print(f"      ⚠️  Invalid shape - expected (H,W,6), got {six_band_array.shape}")
-                    continue
-                
-                # Run prediction via subprocess (handles resizing and preprocessing internally)
-                print(f"      🧠 Running ML prediction via subprocess...")
-                inference_input = {
-                    'image_data': six_band_array,
-                    'tile_index': idx,
-                    'tile_id': str(idx),  # Tile identifier for unique block IDs
-                    'analysis_id': analysis_id,  # Analysis identifier for unique block IDs
-                    'bounds': tile_data.get('bounds'),  # Pass geographic bounds for proper coordinate transform
-                    'transform': tile_data.get('transform'),  # Pass exact rasterio transform from tile
-                    'crs': tile_data.get('crs', 'EPSG:4326'),  # Pass exact CRS
-                    'exact_shape': tile_data.get('exact_shape')  # Pass exact dimensions [H, W]
-                }
-                
-                result = await asyncio.to_thread(ml_service.run_inference_on_tile, inference_input)
-                
-                if not result.get('success', False):
-                    print(f"      ❌ Inference failed: {result.get('error', 'Unknown error')}")
-                    continue
-                
-                # Extract results with better metrics
-                mining_pixels = result.get('mining_pixels', 0)
-                total_pixels = result.get('total_pixels', 1)
-                mining_percentage = result.get('mining_percentage', 0.0)
-                confidence = result.get('confidence', 0.0) / 100.0  # Convert to 0-1 range
-                max_pred = result.get('max_prediction', 0.0)
-                mean_pred = result.get('mean_prediction', 0.0)
-                mine_blocks = result.get('mine_blocks', [])  # Get detected mine block polygons
-                num_mine_blocks = result.get('num_mine_blocks', 0)
-                total_area_m2 = result.get('total_area_m2', None)  # Get total area in square meters
-                mask_shape = result.get('mask_shape', [512, 512])  # Get actual mask dimensions [H, W]
-                prob_map_base64 = result.get('probability_map_base64', None)  # Get raw prediction heatmap
-                
-                # Consider it mining if there are any detected pixels
-                mining_detected = mining_pixels > 0
-                
-                print(f"      ✅ Prediction complete")
-                print(f"      📊 Mining pixels: {mining_pixels}/{total_pixels}")
-                print(f"      📊 Mining coverage: {mining_percentage:.1f}%")
-                print(f"      📊 Mine blocks detected: {num_mine_blocks}")
-                print(f"      📊 Mask dimensions: {mask_shape[0]}×{mask_shape[1]}")
-                if total_area_m2:
-                    print(f"      📊 Total mine area: {total_area_m2/1e6:.4f} km²")
-                print(f"      📊 Confidence: {confidence * 100:.1f}%")
-                print(f"      📊 Max prediction: {max_pred:.3f}")
-                print(f"      📊 Mean prediction: {mean_pred:.3f}")
-                if prob_map_base64:
-                    print(f"      📊 Probability map: Generated ({len(prob_map_base64)} chars)")
-                else:
-                    print(f"      ⚠️  Probability map: Missing from subprocess result")
-                
-                # Store prediction result
-                tile_predictions.append({
-                    'tile_id': tile_data['tile_id'],
-                    'mining_detected': mining_detected,
-                    'mining_percentage': mining_percentage,
-                    'mining_pixels': mining_pixels,
-                    'bounds': tile_data['bounds'],
-                    'confidence': max(confidence, max_pred),  # Use higher of avg or max
-                    'mine_blocks': mine_blocks,  # Add polygon data
-                    'num_mine_blocks': num_mine_blocks,
-                    'total_area_m2': total_area_m2,  # Add total area in square meters
-                    'mask_shape': mask_shape,  # Add actual mask dimensions for pixel-perfect alignment
-                    'probability_map_base64': prob_map_base64  # Add raw prediction heatmap
-                })
-                
-                # Update the corresponding tile in analysis_results with ML results
-                for tile_idx, result_tile in enumerate(analysis_results[analysis_id]["tiles"]):
-                    if result_tile["tile_id"] == tile_data['tile_id']:
-                        analysis_results[analysis_id]["tiles"][tile_idx].update({
-                            'mining_detected': mining_detected,
-                            'mining_percentage': mining_percentage,
-                            'confidence': max(confidence, max_pred),
-                            'mine_blocks': mine_blocks,  # Add mine block polygons
-                            'num_mine_blocks': num_mine_blocks,  # Add count
-                            'total_area_m2': total_area_m2,  # Add total area
-                            'mask_shape': mask_shape,  # Add actual dimensions [H, W]
-                            'probability_map_base64': prob_map_base64  # Add raw prediction heatmap
-                        })
-                        if prob_map_base64:
-                            print(f"      ✅ Probability map added to tile {tile_data['tile_id']}")
-                        else:
-                            print(f"      ❌ Probability map missing for tile {tile_data['tile_id']}")
-                        break
-                
-                print(f"      ✅ Tile {idx} analyzed - detected: {mining_detected}, pixels: {mining_pixels}")
-                
-            except Exception as tile_error:
-                print(f"      ⚠️  Failed to process tile {idx}: {tile_error}")
-                import traceback
-                traceback.print_exc()
-                # Continue processing instead of crashing
-                continue
-            finally:
-                # CRITICAL: Clean up in finally block with safety checks
-                try:
-                    if 'six_band_array' in locals():
-                        del six_band_array
-                    if 'result' in locals():
-                        del result
-                    # ALWAYS force garbage collection after each tile
-                    gc.collect()
-                    if idx % 2 == 0:
-                        print(f"      🧹 Memory cleanup performed")
-                    # Reduced delay for faster processing (50ms instead of 100ms)
-                    # Still provides enough time for system stability
-                    import time
-                    time.sleep(0.05)  # 50ms pause between tiles - optimized for speed
-                except:
-                    pass  # Ignore cleanup errors
-        
-        print(f"✅ ML inference complete on {len(tile_predictions)} tiles")
+
+        inference_payload = {
+            'image_data': mosaic_array,
+            'tile_index': 0,
+            'tile_id': 'mosaic',
+            'analysis_id': analysis_id,
+            'bounds': mosaic_bounds,
+            'transform': mosaic_transform,
+            'crs': mosaic_crs
+        }
+
+        mosaic_result = await asyncio.to_thread(ml_service.run_inference_on_tile, inference_payload)
+
+        if not mosaic_result.get('success', False):
+            error_message = mosaic_result.get('error', 'Unknown error during mosaic inference')
+            print(f"   ❌ Mosaic inference failed: {error_message}")
+            analysis_results[analysis_id].update({
+                "status": "error",
+                "progress": 82,
+                "message": f"❌ AI analysis failed: {error_message}",
+                "current_step": "error"
+            })
+            raise ValueError(error_message)
+
+        mining_pixels = mosaic_result.get('mining_pixels', 0)
+        total_pixels = mosaic_result.get('total_pixels', int(mosaic_array.shape[0] * mosaic_array.shape[1]))
+        mining_percentage = mosaic_result.get('mining_percentage', 0.0)
+        confidence_primary = mosaic_result.get('confidence', 0.0) / 100.0
+        max_pred = mosaic_result.get('max_prediction', 0.0)
+        mean_pred = mosaic_result.get('mean_prediction', 0.0)
+        confidence_value = max(confidence_primary, max_pred, mean_pred)
+        mine_blocks = mosaic_result.get('mine_blocks') or []
+        num_mine_blocks = mosaic_result.get('num_mine_blocks', len(mine_blocks))
+        total_area_m2 = mosaic_result.get('total_area_m2')
+        mask_shape = mosaic_result.get('mask_shape', [mosaic_array.shape[0], mosaic_array.shape[1]])
+        prob_map_base64 = mosaic_result.get('probability_map_base64')
+        mining_detected = mining_pixels > 0
+
+        print("   ✅ Mosaic inference complete")
+        print(f"      📊 Mining pixels: {mining_pixels}/{total_pixels}")
+        print(f"      📊 Mining coverage: {mining_percentage:.2f}%")
+        print(f"      📊 Mine blocks detected: {num_mine_blocks}")
+        print(f"      📊 Confidence (peak/mean): {max_pred:.3f}/{mean_pred:.3f}")
+
+        tile_predictions = [{
+            'tile_id': 'mosaic',
+            'mining_detected': mining_detected,
+            'mining_percentage': mining_percentage,
+            'mining_pixels': mining_pixels,
+            'bounds': mosaic_bounds,
+            'confidence': confidence_value,
+            'mine_blocks': mine_blocks,
+            'num_mine_blocks': num_mine_blocks,
+            'total_area_m2': total_area_m2,
+            'mask_shape': mask_shape,
+            'probability_map_base64': prob_map_base64
+        }]
+
+        analysis_results[analysis_id].update({
+            "progress": 86,
+            "message": "✅ Mosaic analysis complete",
+            "current_step": "processing",
+            "ml_progress": {
+                "current": 1,
+                "total": 1,
+                "currentTileId": "mosaic"
+            }
+        })
+
+        # Append unified mosaic overlay for frontend visualization
+        mosaic_center_lat = (mosaic_bounds[0][1] + mosaic_bounds[2][1]) / 2
+        mosaic_center_lon = (mosaic_bounds[0][0] + mosaic_bounds[1][0]) / 2
+        visualization_index = len(analysis_results[analysis_id]["tiles"]) + 1
+        mosaic_tile_entry = {
+            'id': 'mosaic',
+            'tile_id': 'mosaic',
+            'index': visualization_index,
+            'row': None,
+            'col': None,
+            'coordinates': {
+                'lat': mosaic_center_lat,
+                'lng': mosaic_center_lon
+            },
+            'bounds': mosaic_bounds,
+            'bands': ['B2', 'B3', 'B4', 'B8', 'B11', 'B12'],
+            'bands_used': ['B2', 'B3', 'B4', 'B8', 'B11', 'B12'],
+            'cloudCoverage': 0,
+            'cloud_coverage': 0,
+            'timestamp': datetime.now().isoformat(),
+            'size': f"{mosaic_array.shape[1]}x{mosaic_array.shape[0]}",
+            'status': 'mosaic',
+            'miningDetected': mining_detected,
+            'mining_detected': mining_detected,
+            'miningPercentage': mining_percentage,
+            'mining_percentage': mining_percentage,
+            'confidence': confidence_value,
+            'mine_blocks': mine_blocks,
+            'num_mine_blocks': num_mine_blocks,
+            'total_area_m2': total_area_m2,
+            'mask_shape': mask_shape,
+            'probability_map_base64': prob_map_base64
+        }
+        analysis_results[analysis_id]["tiles"].append(mosaic_tile_entry)
+
+        # Cleanup large mosaic array to free memory
+        del mosaic_array
+        gc.collect()
+
+        print(f"✅ ML inference complete on unified mosaic (tiles merged: {len(tile_6band_data)})")
         
         # Update final ML progress (save length before cleanup)
         total_tiles_processed = len(tile_6band_data) if 'tile_6band_data' in locals() else len(tile_predictions)
@@ -624,8 +682,8 @@ async def process_analysis_realtime(analysis_id: str, aoi_geometry: AOIGeometry)
         })
         
         # Extract detections from each tile
-        import numpy as np
-        
+        from math import cos, radians
+
         detections = []
         detection_id = 1
         
@@ -647,7 +705,7 @@ async def process_analysis_realtime(analysis_id: str, aoi_geometry: AOIGeometry)
             
             # Calculate tile area in m²
             # Approximate: 1 degree ≈ 111 km at equator
-            width_km = (max_lon - min_lon) * 111 * np.cos(np.radians(center_lat))
+            width_km = (max_lon - min_lon) * 111 * cos(radians(center_lat))
             height_km = (max_lat - min_lat) * 111
             area_m2 = int(width_km * height_km * 1_000_000)
             
