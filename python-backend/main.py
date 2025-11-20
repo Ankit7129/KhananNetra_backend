@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # Import routers
 from app.routers import aoi, imagery
 from app.routers import analysis_realtime as analysis
+from app.routers import quantitative_analysis
 
 # Import model loader
 from app.utils.model_loader import get_model_path
@@ -105,6 +106,7 @@ app.add_middleware(
 app.include_router(aoi.router, prefix="/api/v1/aoi", tags=["AOI"])
 app.include_router(analysis.router, prefix="/api/v1/analysis", tags=["Analysis"])
 app.include_router(imagery.router, prefix="/api/v1/imagery", tags=["Imagery"])
+app.include_router(quantitative_analysis.router, prefix="/api/v1/analysis", tags=["Analysis Quantitative"])
 
 
 @app.get("/")

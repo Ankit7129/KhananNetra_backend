@@ -625,6 +625,133 @@ router.put('/:analysisId', async (req, res) => {
 });
 
 /**
+ * PUT /api/history/:analysisId/quantitative
+ * Persist quantitative volumetric analysis output, including logs and visualizations.
+ */
+router.put('/:analysisId/quantitative', async (req, res) => {
+  try {
+    const { analysisId } = req.params;
+    const payload = req.body || {};
+
+    console.log(`\n📦 Persisting quantitative analysis for ${analysisId}`);
+
+    const analysis = await AnalysisHistory.findOne({
+      analysisId,
+      userId: req.user._id
+    });
+
+    if (!analysis) {
+      console.log('❌ Analysis not found or not owned by user');
+      return res.status(404).json({
+        error: 'Analysis not found'
+      });
+    }
+
+    const coerceNumber = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null);
+    const clampArray = (arr, maxLength = 180) => Array.isArray(arr) ? arr.slice(0, maxLength).map((item) => coerceNumber(item) ?? item) : [];
+    const clampMatrix = (matrix, maxRows = 160, maxCols = 160) => {
+      if (!Array.isArray(matrix)) return [];
+      return matrix.slice(0, maxRows).map((row) => {
+        if (!Array.isArray(row)) return [];
+        return row.slice(0, maxCols).map((value) => {
+          if (value === null || value === undefined) return null;
+          return coerceNumber(value);
+        });
+      });
+    };
+
+    const sanitizeGrid = (grid = {}) => {
+      if (!grid || typeof grid !== 'object') return undefined;
+      return {
+        x: clampArray(grid.x, 180),
+        y: clampArray(grid.y, 180),
+        elevation: clampMatrix(grid.elevation),
+        depth: clampMatrix(grid.depth),
+        rimElevation: coerceNumber(grid.rimElevation),
+        resolutionX: coerceNumber(grid.resolutionX),
+        resolutionY: coerceNumber(grid.resolutionY),
+        unit: grid.unit || 'meters'
+      };
+    };
+
+    const sanitizeBlock = (block = {}) => {
+      if (!block || typeof block !== 'object') return null;
+      return {
+        blockId: block.blockId,
+        blockLabel: block.blockLabel,
+        persistentId: block.persistentId,
+        source: block.source,
+        areaSquareMeters: coerceNumber(block.areaSquareMeters),
+        areaHectares: coerceNumber(block.areaHectares),
+        rimElevationMeters: coerceNumber(block.rimElevationMeters),
+        maxDepthMeters: coerceNumber(block.maxDepthMeters),
+        meanDepthMeters: coerceNumber(block.meanDepthMeters),
+        medianDepthMeters: coerceNumber(block.medianDepthMeters),
+        volumeCubicMeters: coerceNumber(block.volumeCubicMeters),
+        volumeTrapezoidalCubicMeters: coerceNumber(block.volumeTrapezoidalCubicMeters),
+        pixelCount: typeof block.pixelCount === 'number' ? Math.round(block.pixelCount) : undefined,
+        centroid: block.centroid,
+        visualization: block.visualization ? {
+          grid: sanitizeGrid(block.visualization.grid),
+          stats: block.visualization.stats,
+          extentUTM: block.visualization.extentUTM,
+          metadata: block.visualization.metadata
+        } : undefined,
+        computedAt: block.computedAt ? new Date(block.computedAt) : undefined,
+        notes: block.notes
+      };
+    };
+
+    const sanitizedBlocks = Array.isArray(payload.blocks)
+      ? payload.blocks.map(sanitizeBlock).filter(Boolean)
+      : [];
+
+    const sanitizedSteps = Array.isArray(payload.steps)
+      ? payload.steps.map((step) => ({
+          name: step.name,
+          status: step.status,
+          durationMs: coerceNumber(step.durationMs),
+          details: Array.isArray(step.details) ? step.details.slice(0, 25) : []
+        }))
+      : [];
+
+    const quantitativeRecord = {
+      status: payload.status || 'completed',
+      executedAt: payload.executedAt ? new Date(payload.executedAt) : new Date(),
+      steps: sanitizedSteps,
+      summary: payload.summary || {},
+      executiveSummary: payload.executiveSummary || {},
+      blocks: sanitizedBlocks,
+      dem: payload.dem,
+      source: payload.source,
+      metadata: {
+        ...(payload.metadata || {}),
+        persistedAt: new Date().toISOString(),
+        persistedBy: req.user._id,
+      }
+    };
+
+    analysis.quantitativeAnalysis = quantitativeRecord;
+    analysis.markModified('quantitativeAnalysis');
+    await analysis.save();
+
+    console.log(`✅ Quantitative analysis stored for ${analysisId}`);
+
+    res.json({
+      message: 'Quantitative analysis saved',
+      analysisId,
+      quantitativeAnalysis: analysis.quantitativeAnalysis
+    });
+  } catch (error) {
+    console.error('❌ Error saving quantitative analysis:', error);
+    res.status(500).json({
+      error: 'Failed to save quantitative analysis',
+      message: error.message
+    });
+  }
+});
+
+/**
  * DELETE /api/history/:analysisId
  * Delete analysis record
  */

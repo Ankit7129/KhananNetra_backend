@@ -43,6 +43,83 @@ const ProcessingLogSchema = new mongoose.Schema({
   details: mongoose.Schema.Types.Mixed
 }, { _id: false });
 
+const QuantitativeGridSchema = new mongoose.Schema({
+  x: { type: [Number], default: [] },
+  y: { type: [Number], default: [] },
+  elevation: { type: [[Number]], default: [] },
+  depth: { type: [[Number]], default: [] },
+  rimElevation: { type: Number, required: false },
+  resolutionX: { type: Number, required: false },
+  resolutionY: { type: Number, required: false },
+  unit: { type: String, default: 'meters' }
+}, { _id: false, strict: false });
+
+const QuantitativeBlockSchema = new mongoose.Schema({
+  blockId: String,
+  blockLabel: String,
+  persistentId: String,
+  source: String,
+  areaSquareMeters: Number,
+  areaHectares: Number,
+  rimElevationMeters: Number,
+  maxDepthMeters: Number,
+  meanDepthMeters: Number,
+  medianDepthMeters: Number,
+  volumeCubicMeters: Number,
+  volumeTrapezoidalCubicMeters: Number,
+  pixelCount: Number,
+  centroid: {
+    lon: Number,
+    lat: Number
+  },
+  visualization: {
+    grid: { type: QuantitativeGridSchema, required: false },
+    stats: mongoose.Schema.Types.Mixed,
+    extentUTM: mongoose.Schema.Types.Mixed,
+    metadata: mongoose.Schema.Types.Mixed
+  },
+  computedAt: { type: Date, required: false },
+  notes: mongoose.Schema.Types.Mixed
+}, { _id: false, strict: false });
+
+const QuantitativeStepSchema = new mongoose.Schema({
+  name: String,
+  status: String,
+  durationMs: Number,
+  details: [String]
+}, { _id: false });
+
+const QuantitativeSummarySchema = new mongoose.Schema({
+  totalVolumeCubicMeters: Number,
+  totalAreaSquareMeters: Number,
+  totalAreaHectares: Number,
+  averageMaxDepthMeters: Number,
+  averageMeanDepthMeters: Number,
+  blockCount: Number,
+  deepestBlock: mongoose.Schema.Types.Mixed,
+  largestBlock: mongoose.Schema.Types.Mixed
+}, { _id: false, strict: false });
+
+const ExecutiveSummarySchema = new mongoose.Schema({
+  headline: mongoose.Schema.Types.Mixed,
+  priorityBlocks: [mongoose.Schema.Types.Mixed],
+  insights: mongoose.Schema.Types.Mixed,
+  policyFlags: mongoose.Schema.Types.Mixed,
+  updatedAt: Date
+}, { _id: false, strict: false });
+
+const QuantitativeAnalysisSchema = new mongoose.Schema({
+  status: { type: String, default: 'completed' },
+  executedAt: { type: Date, default: Date.now },
+  steps: [QuantitativeStepSchema],
+  summary: { type: QuantitativeSummarySchema, default: () => ({}) },
+  executiveSummary: { type: ExecutiveSummarySchema, default: () => ({}) },
+  blocks: { type: [QuantitativeBlockSchema], default: () => [] },
+  dem: mongoose.Schema.Types.Mixed,
+  source: mongoose.Schema.Types.Mixed,
+  metadata: mongoose.Schema.Types.Mixed
+}, { _id: false, strict: false });
+
 const AnalysisHistorySchema = new mongoose.Schema({
   // Analysis Identification
   analysisId: {
@@ -178,6 +255,13 @@ const AnalysisHistorySchema = new mongoose.Schema({
     timestamp: Date
   },
   
+  // Quantitative volumetric analysis snapshot
+  quantitativeAnalysis: {
+    type: QuantitativeAnalysisSchema,
+    required: false,
+    default: undefined
+  },
+
   // Metadata
   metadata: {
     pythonBackendVersion: String,
