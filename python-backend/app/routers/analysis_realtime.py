@@ -4,7 +4,7 @@ This version loads the model in parallel while fetching and displaying RGB tiles
 """
 
 from fastapi import APIRouter, HTTPException
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import asyncio
 import uuid
 import os
@@ -15,10 +15,13 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import numpy as np
+import base64
+import io
 
 from rasterio.io import MemoryFile
 from rasterio.merge import merge
 from rasterio.transform import array_bounds, from_bounds
+from PIL import Image
 
 from app.models.schemas import AnalysisRequest, AOIGeometry
 from app.services.earth_engine_service import get_earth_engine_service
@@ -53,6 +56,48 @@ def _ensure_tile_transform(tile: dict) -> Tuple[np.ndarray, object, str]:
         transform = from_bounds(min_lon, min_lat, max_lon, max_lat, width, height)
 
     return data, transform, crs
+
+
+def _serialize_transform(transform: Optional[object]) -> Optional[List[float]]:
+    """Convert a rasterio Affine transform into a JSON-serializable list."""
+    if transform is None:
+        return None
+    try:
+        if hasattr(transform, 'to_gdal'):
+            values = list(transform.to_gdal())
+        else:
+            values = list(transform)
+        return [float(value) for value in values]
+    except Exception:
+        return None
+
+
+def _encode_rgb_mosaic(
+    mosaic_array: np.ndarray,
+    clip_min: float = 0.0,
+    clip_max: float = 3000.0,
+    max_dimension: int = 1536,
+) -> Optional[str]:
+    """Generate a true-colour PNG preview (base64) from the 6-band mosaic array."""
+    if mosaic_array.ndim != 3 or mosaic_array.shape[2] < 3:
+        return None
+
+    rgb_stack = mosaic_array[:, :, [2, 1, 0]]  # B4 (R), B3 (G), B2 (B)
+    if clip_max <= clip_min:
+        clip_max = clip_min + 1.0
+
+    scaled = np.clip((rgb_stack - clip_min) / (clip_max - clip_min), 0.0, 1.0)
+    rgb_uint8 = (scaled * 255).astype(np.uint8)
+
+    image = Image.fromarray(rgb_uint8, mode='RGB')
+    if max(image.size) > max_dimension:
+        resampling = getattr(Image, 'Resampling', None)
+        resample_filter = getattr(resampling, 'LANCZOS', getattr(Image, 'LANCZOS', Image.BICUBIC)) if resampling else getattr(Image, 'LANCZOS', Image.BICUBIC)
+        image.thumbnail((max_dimension, max_dimension), resample=resample_filter)
+
+    buffer = io.BytesIO()
+    image.save(buffer, format='PNG', optimize=True)
+    return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
 
 def build_mosaic_from_tiles(tile_data_list: List[dict]) -> Tuple[np.ndarray, object, str, List[List[float]]]:
@@ -427,7 +472,9 @@ async def process_analysis_realtime(analysis_id: str, aoi_geometry: AOIGeometry)
                 "error": tile_info.get("error", None),
                 "bands_used": tile_info.get("bands", ['B2', 'B3', 'B4', 'B8', 'B11', 'B12']),
                 "cloud_coverage": 0,  # TODO: Get from tile_info if available
-                "timestamp": tile_info.get("timestamp", "")
+                "timestamp": tile_info.get("timestamp", ""),
+                "transform": _serialize_transform(tile_info.get("transform")),
+                "crs": tile_info.get("crs")
             }
             
             # Debug: Log what we're adding
@@ -586,6 +633,9 @@ async def process_analysis_realtime(analysis_id: str, aoi_geometry: AOIGeometry)
         print(f"      📊 Mine blocks detected: {num_mine_blocks}")
         print(f"      📊 Confidence (peak/mean): {max_pred:.3f}/{mean_pred:.3f}")
 
+        serialized_transform = _serialize_transform(mosaic_transform)
+        mosaic_rgb_base64 = _encode_rgb_mosaic(mosaic_array)
+
         tile_predictions = [{
             'tile_id': 'mosaic',
             'mining_detected': mining_detected,
@@ -597,7 +647,10 @@ async def process_analysis_realtime(analysis_id: str, aoi_geometry: AOIGeometry)
             'num_mine_blocks': num_mine_blocks,
             'total_area_m2': total_area_m2,
             'mask_shape': mask_shape,
-            'probability_map_base64': prob_map_base64
+            'probability_map_base64': prob_map_base64,
+            'image_base64': mosaic_rgb_base64,
+            'transform': serialized_transform,
+            'crs': mosaic_crs
         }]
 
         analysis_results[analysis_id].update({
@@ -642,7 +695,10 @@ async def process_analysis_realtime(analysis_id: str, aoi_geometry: AOIGeometry)
             'num_mine_blocks': num_mine_blocks,
             'total_area_m2': total_area_m2,
             'mask_shape': mask_shape,
-            'probability_map_base64': prob_map_base64
+            'probability_map_base64': prob_map_base64,
+            'image_base64': mosaic_rgb_base64,
+            'transform': serialized_transform,
+            'crs': mosaic_crs
         }
         analysis_results[analysis_id]["tiles"].append(mosaic_tile_entry)
 
@@ -853,15 +909,9 @@ async def process_analysis_realtime(analysis_id: str, aoi_geometry: AOIGeometry)
             # Clear tile data from memory (keep metadata for results page)
             if analysis_id in analysis_results:
                 try:
-                    # Keep results but clear large tile images to save memory
                     if "tiles" in analysis_results[analysis_id]:
                         tiles = analysis_results[analysis_id]["tiles"]
-                        for tile in tiles:
-                            # Clear large base64 images but keep everything else
-                            if "image_base64" in tile and tile["image_base64"]:
-                                tile["image_base64"] = None  # Clear to save memory
-                            # Keep probability maps (smaller) for visualization
-                    logger.info(f"   ✅ Large tile images cleared from memory ({len(tiles)} tiles)")
+                        logger.info(f"   ✅ Preserving {sum(1 for tile in tiles if tile.get('image_base64'))} tile previews for downstream persistence")
                 except Exception as clear_err:
                     logger.warning(f"   ⚠️  Error clearing tile data: {clear_err}")
             

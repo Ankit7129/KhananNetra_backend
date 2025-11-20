@@ -660,6 +660,69 @@ router.put('/:analysisId/quantitative', async (req, res) => {
       });
     };
 
+    const sanitizeBounds = (bounds) => {
+      if (!Array.isArray(bounds)) {
+        return undefined;
+      }
+      const flatBounds = bounds.length === 4 && bounds.every((value) => typeof value === 'number' || typeof value === 'string')
+        ? bounds
+        : null;
+      if (!flatBounds) {
+        return undefined;
+      }
+      const numeric = flatBounds.map((value) => {
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          return value;
+        }
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : null;
+      });
+      return numeric.every((value) => value !== null) ? numeric : undefined;
+    };
+
+    const sanitizeTransform = (transform) => {
+      if (!Array.isArray(transform)) {
+        return undefined;
+      }
+      const numeric = transform.slice(0, 6).map((value) => {
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          return value;
+        }
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : null;
+      });
+      return numeric.every((value) => value !== null) ? numeric : undefined;
+    };
+
+    const sanitizeImagery = (imagery = {}) => {
+      if (!imagery || typeof imagery !== 'object') {
+        return undefined;
+      }
+
+      const imageBase64 = typeof imagery.imageBase64 === 'string' && imagery.imageBase64.trim().length > 0
+        ? imagery.imageBase64
+        : undefined;
+      const probabilityBase64 = typeof imagery.probabilityBase64 === 'string' && imagery.probabilityBase64.trim().length > 0
+        ? imagery.probabilityBase64
+        : undefined;
+      const tileLabel = typeof imagery.tileLabel === 'string' ? imagery.tileLabel : undefined;
+      const tileBounds = sanitizeBounds(imagery.tileBounds);
+      const blockBounds = sanitizeBounds(imagery.blockBounds);
+      const transform = sanitizeTransform(imagery.transform);
+      const crs = typeof imagery.crs === 'string' && imagery.crs.trim().length > 0 ? imagery.crs : undefined;
+
+      const cleaned = {};
+      if (imageBase64) cleaned.imageBase64 = imageBase64;
+      if (probabilityBase64) cleaned.probabilityBase64 = probabilityBase64;
+      if (tileBounds) cleaned.tileBounds = tileBounds;
+      if (blockBounds) cleaned.blockBounds = blockBounds;
+      if (tileLabel) cleaned.tileLabel = tileLabel;
+      if (transform) cleaned.transform = transform;
+      if (crs) cleaned.crs = crs;
+
+      return Object.keys(cleaned).length ? cleaned : undefined;
+    };
+
     const sanitizeGrid = (grid = {}) => {
       if (!grid || typeof grid !== 'object') return undefined;
       return {
@@ -676,7 +739,10 @@ router.put('/:analysisId/quantitative', async (req, res) => {
 
     const sanitizeBlock = (block = {}) => {
       if (!block || typeof block !== 'object') return null;
-      return {
+
+      const imagery = sanitizeImagery(block.visualization?.imagery || block.imagery);
+
+      const base = {
         blockId: block.blockId,
         blockLabel: block.blockLabel,
         persistentId: block.persistentId,
@@ -691,14 +757,28 @@ router.put('/:analysisId/quantitative', async (req, res) => {
         volumeTrapezoidalCubicMeters: coerceNumber(block.volumeTrapezoidalCubicMeters),
         pixelCount: typeof block.pixelCount === 'number' ? Math.round(block.pixelCount) : undefined,
         centroid: block.centroid,
-        visualization: block.visualization ? {
-          grid: sanitizeGrid(block.visualization.grid),
-          stats: block.visualization.stats,
-          extentUTM: block.visualization.extentUTM,
-          metadata: block.visualization.metadata
-        } : undefined,
         computedAt: block.computedAt ? new Date(block.computedAt) : undefined,
         notes: block.notes
+      };
+
+      let visualizationPayload = block.visualization ? {
+        grid: sanitizeGrid(block.visualization.grid),
+        stats: block.visualization.stats,
+        extentUTM: block.visualization.extentUTM,
+        metadata: block.visualization.metadata
+      } : undefined;
+
+      if (imagery) {
+        if (visualizationPayload) {
+          visualizationPayload.imagery = imagery;
+        } else {
+          visualizationPayload = { imagery };
+        }
+      }
+
+      return {
+        ...base,
+        visualization: visualizationPayload
       };
     };
 

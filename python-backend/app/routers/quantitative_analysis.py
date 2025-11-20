@@ -6,8 +6,7 @@ Transforms detection polygons into DEM-aligned volume metrics.
 from __future__ import annotations
 
 import asyncio
-import gzip
-import io
+import logging
 import math
 import os
 import shutil
@@ -36,15 +35,29 @@ from shapely.ops import transform as shapely_transform, unary_union
 import pyproj
 
 
+logger = logging.getLogger(__name__)
+
+
 router = APIRouter()
 
-SRTM_CACHE_DIR = Path(os.getenv("QUANT_ANALYSIS_DEM_CACHE", tempfile.gettempdir()) ) / "khanan_srtm_cache"
-SRTM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+DEM_CACHE_DIR = Path(os.getenv("QUANT_ANALYSIS_DEM_CACHE", tempfile.gettempdir())) / "khanan_copernicus_cache"
+DEM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+COPERNICUS_BASE_URL = os.getenv(
+    "COPERNICUS_DEM_BASE_URL",
+    "https://copernicus-dem-30m.s3.amazonaws.com",
+)
+COPERNICUS_PRODUCT = os.getenv("COPERNICUS_DEM_PRODUCT", "Copernicus_DSM_COG_10")
+COPERNICUS_FALLBACK_PRODUCT = os.getenv("COPERNICUS_DEM_FALLBACK_PRODUCT", "Copernicus_DSM_COG_30")
+COPERNICUS_DATASET_LABEL = os.getenv(
+    "COPERNICUS_DEM_LABEL",
+    "Copernicus GLO-30 (10m) DEM",
+)
 
 PIXEL_RESOLUTION_METERS = 10.0  # Target DEM resolution after resampling
 RIM_MIN_WIDTH_PIXELS = 8
 RIM_DILATION_ITERATIONS = 2
-MAX_TILE_DOWNLOAD_SECONDS = 60
+MAX_TILE_DOWNLOAD_SECONDS = int(os.getenv("COPERNICUS_DEM_TIMEOUT_SECONDS", "180"))
 
 try:
     MAX_VISUALIZATION_DIMENSION = max(16, min(160, int(os.getenv("QUANT_ANALYSIS_MAX_GRID", "96"))))
@@ -72,6 +85,12 @@ class QuantitativeAnalysisRequest(BaseModel):
     model_config = {
         "extra": "ignore"
     }
+
+
+@dataclass
+class DemTile:
+    path: Path
+    product: str
 
 
 @dataclass
@@ -112,43 +131,64 @@ class QuantitativeProcessingError(Exception):
     """Raised when quantitative processing fails in a recoverable way."""
 
 
-def _tile_name(lat: int, lon: int) -> str:
+def _copernicus_tile_key(lat: int, lon: int) -> str:
     lat_prefix = "N" if lat >= 0 else "S"
     lon_prefix = "E" if lon >= 0 else "W"
-    return f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}"
+    return f"{lat_prefix}{abs(lat):02d}_00_{lon_prefix}{abs(lon):03d}_00"
 
 
-def _ensure_srtm_tile(lat: int, lon: int, temp_dir: Path, step_details: List[str]) -> Path:
-    tile_name = _tile_name(lat, lon)
-    cache_path = SRTM_CACHE_DIR / f"{tile_name}.tif"
-    if cache_path.exists():
-        step_details.append(f"Cache hit for tile {tile_name}")
-        return cache_path
+def _copernicus_product_candidates() -> List[str]:
+    preferred = COPERNICUS_PRODUCT.strip()
+    fallback = COPERNICUS_FALLBACK_PRODUCT.strip() if COPERNICUS_FALLBACK_PRODUCT else ""
+    candidates = [candidate for candidate in [preferred, fallback, "Copernicus_DSM_COG_10", "Copernicus_DSM_COG_30"] if candidate]
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for candidate in candidates:
+        if candidate not in seen:
+            ordered.append(candidate)
+            seen.add(candidate)
+    return ordered
 
-    hgt_cache_path = SRTM_CACHE_DIR / f"{tile_name}.hgt"
-    if not hgt_cache_path.exists():
-        url = f"https://s3.amazonaws.com/elevation-tiles-prod/skadi/{tile_name[:3]}/{tile_name}.hgt.gz"
-        step_details.append(f"Downloading {tile_name} from {url}")
-        response = requests.get(url, timeout=MAX_TILE_DOWNLOAD_SECONDS)
-        if response.status_code != 200:
-            raise QuantitativeProcessingError(f"Failed to download DEM tile {tile_name}: HTTP {response.status_code}")
-        with gzip.GzipFile(fileobj=io.BytesIO(response.content)) as gz:
-            raw_data = gz.read()
-        hgt_cache_path.write_bytes(raw_data)
-    else:
-        step_details.append(f"Using cached HGT for tile {tile_name}")
 
-    # Convert HGT to GeoTIFF for faster subsequent reads
+def _download_copernicus_tile(url: str, cache_path: Path) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    with rasterio.open(hgt_cache_path) as src:
-        profile = src.profile.copy()
-        data = src.read(1)
-        profile.update(driver="GTiff", compress="LZW")
-        with rasterio.open(cache_path, "w", **profile) as dst:
-            dst.write(data, 1)
+    temp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    with requests.get(url, stream=True, timeout=MAX_TILE_DOWNLOAD_SECONDS) as response:
+        if response.status_code != 200:
+            raise QuantitativeProcessingError(f"HTTP {response.status_code} for DEM tile {url}")
+        with open(temp_path, "wb") as dst:
+            for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+                if chunk:
+                    dst.write(chunk)
+    temp_path.replace(cache_path)
 
-    step_details.append(f"Converted {tile_name} to GeoTIFF cache")
-    return cache_path
+
+def _ensure_copernicus_tile(lat: int, lon: int, step_details: List[str]) -> DemTile:
+    tile_key = _copernicus_tile_key(lat, lon)
+    errors: List[str] = []
+    for product in _copernicus_product_candidates():
+        folder = f"{product}_{tile_key}_DEM"
+        filename = f"{folder}.tif"
+        cache_path = DEM_CACHE_DIR / product / filename
+        if cache_path.exists():
+            step_details.append(f"Cache hit for {folder}")
+            return DemTile(path=cache_path, product=product)
+
+        url = f"{COPERNICUS_BASE_URL}/{folder}/{filename}"
+        step_details.append(f"Fetching {folder} from {url}")
+        try:
+            _download_copernicus_tile(url, cache_path)
+            logger.info("Fetched Copernicus tile %s (%s)", folder, url)
+            return DemTile(path=cache_path, product=product)
+        except QuantitativeProcessingError as exc:
+            errors.append(str(exc))
+            cache_path.unlink(missing_ok=True)
+            logger.warning("Failed to fetch Copernicus tile %s (%s): %s", folder, url, exc)
+            continue
+
+    raise QuantitativeProcessingError(
+        f"Failed to download Copernicus DEM tile {tile_key}: {'; '.join(errors) if errors else 'no sources available'}"
+    )
 
 
 def _extract_block_features(results: Dict[str, Any], step_logger: StepLogger) -> Tuple[List[Dict[str, Any]], str]:
@@ -220,13 +260,24 @@ def _compute_utm_crs(union_geometry: MultiPolygon) -> pyproj.CRS:
 
 @dataclass
 class DemData:
-    array: np.ndarray
+    surface: np.ndarray
+    terrain: np.ndarray
     transform: rasterio.Affine
     crs: pyproj.CRS
     resolution: float
-    tile_paths: List[Path]
+    tiles: List[DemTile]
     bounds_utm: Tuple[float, float, float, float]
     bounds_wgs84: Tuple[float, float, float, float]
+    dataset_label: str
+    dtm_method: str
+
+    @property
+    def array(self) -> np.ndarray:
+        return self.terrain
+
+    @property
+    def tile_paths(self) -> List[Path]:
+        return [tile.path for tile in self.tiles]
 
 
 def _build_dem(bounds: Tuple[float, float, float, float], target_crs: pyproj.CRS, step_logger: StepLogger) -> DemData:
@@ -237,20 +288,32 @@ def _build_dem(bounds: Tuple[float, float, float, float], target_crs: pyproj.CRS
     lon_min = math.floor(minx - buffer_deg)
     lon_max = math.ceil(maxx + buffer_deg)
 
-    with step_logger.step("Acquire SRTM tiles") as details:
-        temp_dir = Path(tempfile.mkdtemp(prefix="quant_dem_"))
-        tile_paths: List[Path] = []
-        try:
-            for lat in range(lat_min, lat_max):
-                for lon in range(lon_min, lon_max):
-                    path = _ensure_srtm_tile(lat, lon, temp_dir, details)
-                    tile_paths.append(path)
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+    with step_logger.step("Acquire Copernicus DEM tiles") as details:
+        tile_records: List[DemTile] = []
+        for lat in range(lat_min, lat_max):
+            for lon in range(lon_min, lon_max):
+                try:
+                    tile = _ensure_copernicus_tile(lat, lon, details)
+                    tile_records.append(tile)
+                except QuantitativeProcessingError as exc:
+                    details.append(str(exc))
 
-        if not tile_paths:
+        if not tile_records:
             raise QuantitativeProcessingError("No DEM tiles available for requested area")
-        details.append(f"Prepared {len(tile_paths)} DEM tile(s)")
+
+        details.append(
+            f"Prepared {len(tile_records)} Copernicus DEM tile(s) spanning products: "
+            + ", ".join(sorted({tile.product for tile in tile_records}))
+        )
+        logger.info(
+            "Prepared %d Copernicus DEM tiles (%s) covering bounds %.4f, %.4f → %.4f, %.4f",
+            len(tile_records),
+            ",".join(sorted({tile.product for tile in tile_records})),
+            minx,
+            miny,
+            maxx,
+            maxy,
+        )
 
     with step_logger.step("Merge & resample DEM") as details:
         gdalbuildvrt = shutil.which("gdalbuildvrt")
@@ -277,7 +340,7 @@ def _build_dem(bounds: Tuple[float, float, float, float], target_crs: pyproj.CRS
                     gdalbuildvrt,
                     "-q",
                     str(vrt_path),
-                    *[str(path) for path in tile_paths],
+                    *[str(tile.path) for tile in tile_records],
                 ]
                 subprocess.run(build_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -319,20 +382,32 @@ def _build_dem(bounds: Tuple[float, float, float, float], target_crs: pyproj.CRS
                     "GDAL warp completed with precise alignment and resolution control"
                 )
 
+                terrain, dtm_summary = _derive_dtm(destination, PIXEL_RESOLUTION_METERS)
+                details.append(f"Derived terrain model via {dtm_summary}")
+                logger.info(
+                    "GDAL pipeline produced terrain grid %sx%s (%.1fm resolution)",
+                    destination.shape[0],
+                    destination.shape[1],
+                    PIXEL_RESOLUTION_METERS,
+                )
+
                 return DemData(
-                    array=destination,
+                    surface=destination,
+                    terrain=terrain,
                     transform=dst_transform,
                     crs=target_crs,
                     resolution=PIXEL_RESOLUTION_METERS,
-                    tile_paths=tile_paths,
+                    tiles=tile_records,
                     bounds_utm=(minx_utm, miny_utm, maxx_utm, maxy_utm),
                     bounds_wgs84=(ll_lon, ll_lat, ur_lon, ur_lat),
+                    dataset_label=COPERNICUS_DATASET_LABEL,
+                    dtm_method=dtm_summary,
                 )
             finally:
                 shutil.rmtree(temp_root, ignore_errors=True)
 
         details.append("GDAL binaries not found, falling back to Rasterio reprojection")
-        datasets = [rasterio.open(path) for path in tile_paths]
+        datasets = [rasterio.open(tile.path) for tile in tile_records]
         try:
             mosaic, mosaic_transform = merge(datasets)
             mosaic_array = mosaic[0].astype(np.float32, copy=False)
@@ -370,14 +445,26 @@ def _build_dem(bounds: Tuple[float, float, float, float], target_crs: pyproj.CRS
                 f"Resampled DEM to {destination.shape[1]}x{destination.shape[0]} grid @ {PIXEL_RESOLUTION_METERS:.0f}m"
             )
 
+            terrain, dtm_summary = _derive_dtm(destination, PIXEL_RESOLUTION_METERS)
+            details.append(f"Derived terrain model via {dtm_summary}")
+            logger.info(
+                "Rasterio pipeline produced terrain grid %sx%s (%.1fm resolution)",
+                destination.shape[0],
+                destination.shape[1],
+                PIXEL_RESOLUTION_METERS,
+            )
+
             return DemData(
-                array=destination,
+                surface=destination,
+                terrain=terrain,
                 transform=dst_transform,
                 crs=target_crs,
                 resolution=PIXEL_RESOLUTION_METERS,
-                tile_paths=tile_paths,
+                tiles=tile_records,
                 bounds_utm=(minx_utm, miny_utm, maxx_utm, maxy_utm),
                 bounds_wgs84=(ll_lon, ll_lat, ur_lon, ur_lat),
+                dataset_label=COPERNICUS_DATASET_LABEL,
+                dtm_method=dtm_summary,
             )
         finally:
             for ds in datasets:
@@ -408,14 +495,78 @@ def _robust_rim_elevation(dem: np.ndarray, block_mask: np.ndarray, iterations: i
     return median
 
 
-def _simpson_volume(depth_surface: np.ndarray, pixel_size: float) -> float:
+def _derive_dtm(dsm: np.ndarray, pixel_resolution: float) -> Tuple[np.ndarray, str]:
+    terrain = np.array(dsm, copy=True)
+    finite_mask = np.isfinite(terrain)
+    if not finite_mask.any():
+        return terrain, "DTM fallback: no finite DEM values"
+
+    fill_value = float(np.nanmedian(terrain[finite_mask]))
+    filled = np.where(finite_mask, terrain, fill_value).astype(np.float32)
+
+    window_meters = max(24.0, 3.0 * pixel_resolution)
+    window_pixels = max(3, int(round(window_meters / pixel_resolution)))
+    if window_pixels % 2 == 0:
+        window_pixels += 1
+
+    percentile = 30.0
+    ground = ndimage.percentile_filter(
+        filled,
+        percentile=percentile,
+        size=(window_pixels, window_pixels),
+        mode="nearest",
+    ).astype(np.float32)
+
+    opening_pixels = max(3, int(round(12.0 / pixel_resolution)))
+    if opening_pixels % 2 == 0:
+        opening_pixels += 1
+
     try:
-        first_pass = integrate.simpson(depth_surface, dx=pixel_size, axis=0)
-        volume = integrate.simpson(first_pass, dx=pixel_size)
-        return float(max(0.0, volume))
+        opened = ndimage.grey_opening(
+            ground,
+            size=(opening_pixels, opening_pixels),
+            mode="nearest",
+        ).astype(np.float32)
+    except Exception:  # noqa: BLE001
+        opened = ground
+
+    sigma = max(0.6, 2.5 / pixel_resolution)
+    smoothed = ndimage.gaussian_filter(opened, sigma=sigma)
+    smoothed = np.minimum(smoothed, filled)
+    smoothed = smoothed.astype(np.float32)
+    smoothed[~finite_mask] = np.nan
+
+    summary = (
+        f"percentile={percentile:.0f}, window_px={window_pixels}, opening_px={opening_pixels}, gaussian_sigma={sigma:.2f}"
+    )
+
+    return smoothed, summary
+
+
+def _prismoidal_volume(depth_surface: np.ndarray, pixel_size: float) -> Tuple[float, float, float]:
+    """Estimate volume with prismoidal integration and supporting metrics.
+
+    Returns a tuple of (prismoidal_volume, simpson_volume, trapezoidal_volume).
+    """
+
+    try:
+        simpson_axis = integrate.simpson(depth_surface, dx=pixel_size, axis=0)
+        simpson_volume = float(integrate.simpson(simpson_axis, dx=pixel_size))
+
+        trapezoid_axis = integrate.trapezoid(depth_surface, dx=pixel_size, axis=0)
+        trapezoid_volume = float(integrate.trapezoid(trapezoid_axis, dx=pixel_size))
+
+        prismoidal = (2.0 * simpson_volume + trapezoid_volume) / 3.0
     except (ValueError, RuntimeError):
-        # Fallback to summation
-        return float(depth_surface.sum() * (pixel_size ** 2))
+        cell_area = pixel_size ** 2
+        trapezoid_volume = float(depth_surface.sum() * cell_area)
+        simpson_volume = trapezoid_volume
+        prismoidal = trapezoid_volume
+
+    prismoidal = float(max(0.0, prismoidal))
+    simpson_volume = float(max(0.0, simpson_volume))
+    trapezoid_volume = float(max(0.0, trapezoid_volume))
+    return prismoidal, simpson_volume, trapezoid_volume
 
 
 def _array_to_serializable(matrix: np.ndarray) -> List[List[Optional[float]]]:
@@ -634,17 +785,22 @@ def _generate_block_metrics(
     block_metrics: List[Dict[str, Any]] = []
     with step_logger.step("Compute volumetric metrics") as details:
         pixel_area = dem.resolution ** 2
+        tile_products = sorted({tile.product for tile in dem.tiles})
         for idx, feature in enumerate(features, start=1):
             block_mask = label_raster == idx
             coverage_pixels = int(block_mask.sum())
             if coverage_pixels == 0:
-                details.append(f"Block {feature['label']} skipped (no DEM coverage)")
+                message = f"Block {feature['label']} skipped (no DEM coverage)"
+                details.append(message)
+                logger.warning(message)
                 continue
 
             block_dem = np.where(block_mask, dem.array, np.nan)
             elevation_values = block_dem[np.isfinite(block_dem)]
             if elevation_values.size == 0:
-                details.append(f"Block {feature['label']} skipped (DEM nodata)")
+                message = f"Block {feature['label']} skipped (DEM nodata)"
+                details.append(message)
+                logger.warning(message)
                 continue
 
             rim_elevation = _robust_rim_elevation(dem.array, block_mask)
@@ -656,11 +812,11 @@ def _generate_block_metrics(
             depth_surface = np.where(block_mask, depth_surface, 0)
             depth_surface = np.nan_to_num(depth_surface, nan=0.0)
 
-            volume_simpson = _simpson_volume(depth_surface, dem.resolution)
-            volume_sum = float(depth_surface.sum() * pixel_area)
+            prismoidal_volume, volume_simpson, volume_trapezoid = _prismoidal_volume(depth_surface, dem.resolution)
+            volume_cell_sum = float(depth_surface.sum() * pixel_area)
             area_sq_m = transformed_geometries[idx - 1].area
             max_depth = float(np.nanmax(depth_surface))
-            mean_depth = float(volume_simpson / area_sq_m) if area_sq_m > 0 else 0.0
+            mean_depth = float(prismoidal_volume / area_sq_m) if area_sq_m > 0 else 0.0
             median_depth = float(np.nanmedian(depth_surface[block_mask]))
 
             geom_wgs84 = feature["geometry"]
@@ -687,17 +843,35 @@ def _generate_block_metrics(
                 "maxDepthMeters": max_depth,
                 "meanDepthMeters": mean_depth,
                 "medianDepthMeters": median_depth,
-                "volumeCubicMeters": volume_simpson,
-                "volumeTrapezoidalCubicMeters": volume_sum,
+                "volumeCubicMeters": prismoidal_volume,
+                "volumePrismoidalCubicMeters": prismoidal_volume,
+                "volumeSimpsonCubicMeters": volume_simpson,
+                "volumeTrapezoidalCubicMeters": volume_trapezoid,
+                "volumeCellSummationCubicMeters": volume_cell_sum,
                 "centroid": {
                     "lon": float(centroid.x),
                     "lat": float(centroid.y),
                 },
                 "visualization": visualization_payload,
+                "elevationModel": {
+                    "dataset": dem.dataset_label,
+                    "dtmMethod": dem.dtm_method,
+                    "products": tile_products,
+                    "type": "DTM",
+                },
                 "computedAt": datetime.utcnow().isoformat(),
             })
-            details.append(
-                f"Processed {feature['label']}: area={area_sq_m:.1f} m², volume={volume_simpson:.1f} m³, max depth={max_depth:.2f} m"
+            summary_message = (
+                f"Processed {feature['label']}: area={area_sq_m:.1f} m², volume={prismoidal_volume:.1f} m³, max depth={max_depth:.2f} m"
+            )
+            details.append(summary_message)
+            logger.info(
+                "Processed block %s | area=%.1f m² volume=%.1f m³ maxDepth=%.2f m meanDepth=%.2f m",
+                feature['label'],
+                area_sq_m,
+                prismoidal_volume,
+                max_depth,
+                mean_depth,
             )
 
     return block_metrics
@@ -787,6 +961,19 @@ def _run_quantitative_sync(analysis_id: str, payload: QuantitativeAnalysisReques
             "tileCount": len(dem.tile_paths),
             "boundsUTM": dem.bounds_utm,
             "boundsWGS84": dem.bounds_wgs84,
+            "dataset": {
+                "label": dem.dataset_label,
+                "products": sorted({tile.product for tile in dem.tiles}),
+                "dtmMethod": dem.dtm_method,
+                "type": "DTM",
+            },
+            "tiles": [
+                {
+                    "path": str(tile.path),
+                    "product": tile.product,
+                }
+                for tile in dem.tiles
+            ],
         },
         "source": {
             "blockCollection": source,
@@ -795,6 +982,9 @@ def _run_quantitative_sync(analysis_id: str, payload: QuantitativeAnalysisReques
             "generatedAt": generated_at,
             "visualizationAvailable": visualization_ready,
             "pixelResolutionMeters": dem.resolution,
+            "demDataset": dem.dataset_label,
+            "demModel": "DTM",
+            "dtmDerivation": dem.dtm_method,
         },
     }
 
