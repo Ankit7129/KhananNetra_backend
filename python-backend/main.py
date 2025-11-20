@@ -14,8 +14,13 @@ import signal
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
+from app.utils.console import patch_console_outputs
+
 # Load environment variables from .env file
 load_dotenv()
+
+# Ensure console output stays ASCII-only (prevents Windows code-page errors)
+patch_console_outputs()
 
 # Configure logging
 logging.basicConfig(

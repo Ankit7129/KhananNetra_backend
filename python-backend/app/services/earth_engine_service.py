@@ -13,6 +13,18 @@ import tempfile
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 import json
+import builtins
+
+
+def _ascii_print(*args, **kwargs) -> None:
+    sanitized_args = [
+        arg.encode("ascii", "ignore").decode("ascii") if isinstance(arg, str) else arg
+        for arg in args
+    ]
+    builtins.print(*sanitized_args, **kwargs)
+
+
+print = _ascii_print  # type: ignore
 
 
 class EarthEngineService:

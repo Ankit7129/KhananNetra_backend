@@ -12,6 +12,7 @@ import tempfile
 import rasterio
 import gc
 import logging
+import builtins
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import numpy as np
@@ -30,6 +31,18 @@ from app.services.tile_fetching_service import TileFetchingService
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _ascii_print(*args, **kwargs) -> None:
+    """Best-effort console print that strips non-ASCII characters for Windows shells."""
+    sanitized_args = [
+        arg.encode("ascii", "ignore").decode("ascii") if isinstance(arg, str) else arg
+        for arg in args
+    ]
+    builtins.print(*sanitized_args, **kwargs)
+
+
+print = _ascii_print  # type: ignore
 
 # In-memory storage for analysis results - with automatic cleanup
 analysis_results: Dict[str, dict] = {}
@@ -877,13 +890,14 @@ async def process_analysis_realtime(analysis_id: str, aoi_geometry: AOIGeometry)
         print(f"   Mining areas detected: {len(detections)}")
         
     except Exception as e:
-        print(f"❌ Analysis {analysis_id} failed: {str(e)}")
+        error_message = f"Analysis {analysis_id} failed: {str(e)}"
+        print(f"[ERROR] {error_message}")
         import traceback
         traceback.print_exc()
         
         analysis_results[analysis_id].update({
             "status": "failed",
-            "message": f"❌ Error: {str(e)}",
+            "message": error_message,
             "current_step": "error"
         })
     

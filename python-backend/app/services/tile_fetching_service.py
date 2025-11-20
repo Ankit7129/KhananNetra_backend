@@ -7,10 +7,22 @@ import ee
 import numpy as np
 import requests
 import io
+import builtins
 from PIL import Image
 from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import base64
+
+
+def _ascii_print(*args, **kwargs) -> None:
+    sanitized_args = [
+        arg.encode("ascii", "ignore").decode("ascii") if isinstance(arg, str) else arg
+        for arg in args
+    ]
+    builtins.print(*sanitized_args, **kwargs)
+
+
+print = _ascii_print  # type: ignore
 
 
 class TileFetchingService:
