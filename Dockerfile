@@ -1,12 +1,19 @@
 # ============================================================================== 
 # Production Dockerfile for KhananNetra Backend (Node.js + Python)
-# Single stage, always uses port 8080
-# Force linux/amd64 so pip can pull matching binary wheels (Cloud Run default)
+# Single stage image tuned for Cloud Run. Build for linux/amd64 using build args.
 # ============================================================================== 
 
-FROM --platform=linux/amd64 node:22-slim
+FROM node:22-slim
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 WORKDIR /app
+
+# Keep installs non-interactive and limit Python file noise
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8
 
 # Install system dependencies for Python backend and geospatial libraries
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -14,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     python3-venv \
     curl \
+    ca-certificates \
     wget \
     gdal-bin \
     libgdal-dev \
@@ -27,42 +35,46 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrender1 \
     dos2unix \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy package files first for better caching
+# Install Node.js production dependencies early for better caching
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts
+ENV NODE_ENV=production
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
-# Copy the rest of the application
+# Prepare isolated Python environment before copying sources to maximize cache reuse
+RUN python3 -m venv /app/venv
+ENV PATH="/app/venv/bin:$PATH"
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_PREFER_BINARY=1 \
+    GDAL_DATA=/usr/share/gdal/ \
+    PROJ_LIB=/usr/share/proj
+
+# Install Python dependencies using requirements cache layer
+COPY python-backend/requirements.txt python-backend/requirements.txt
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir certifi==2023.11.17 && \
+    pip install --no-cache-dir -r python-backend/requirements.txt
+
+# Copy application source
 COPY . .
 
-# Fix line endings and make script executable
+# Normalize scripts and set permissions
 RUN dos2unix /app/start-production.sh && \
     chmod +x /app/start-production.sh
 
-# Create and activate Python virtual environment
-RUN python3 -m venv /app/venv
-ENV PATH="/app/venv/bin:$PATH"
+# Prepare runtime directories and drop root privileges
+RUN mkdir -p /tmp/kagglehub /app/logs && \
+    chown -R node:node /app
 
-# Set up Python backend in virtual environment
-ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_PREFER_BINARY=1
-
-RUN cd python-backend && \
-    pip install --upgrade pip setuptools wheel && \
-    pip install certifi==2023.11.17 && \
-    pip install -r requirements.txt
-
-# Create cache directory
-RUN mkdir -p /tmp/kagglehub /app/logs
+USER node
 
 # Environment variables (defaults - can be overridden in Cloud Run)
-ENV NODE_ENV=production
-ENV PORT=8080
-ENV PYTHON_BACKEND_PORT=9000
-ENV PYTHON_BACKEND_URL=http://127.0.0.1:9000
+ENV PORT=8080 \
+    PYTHON_BACKEND_PORT=9000 \
+    PYTHON_BACKEND_URL=http://127.0.0.1:9000
 
 EXPOSE 8080
 
