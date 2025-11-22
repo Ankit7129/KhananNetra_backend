@@ -199,9 +199,14 @@ router.post('/analysis/start', optionalProtect, async (req, res) => {
 
     console.log('🚀 Starting analysis for AOI:', aoi_id, 'User:', userId);
 
+    const payload = { aoi_id };
+    if (geometry && typeof geometry === 'object') {
+      payload.geometry = geometry;
+    }
+
     const response = await axios.post(
       `${PYTHON_API_URL}/api/v1/analysis/start`,
-      { aoi_id },
+      payload,
       {
         headers: {
           'Content-Type': 'application/json'

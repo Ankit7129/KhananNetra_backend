@@ -253,8 +253,23 @@ async def start_analysis_realtime(request: AnalysisRequest):
         
         analysis_id = str(uuid.uuid4())
         
-        # Fetch the AOI using aoi_id
+        # Fetch the AOI using aoi_id; recreate it if geometry is provided but cache is cold
         aoi = geospatial_service.get_aoi(request.aoi_id)
+
+        if not aoi and request.geometry is not None:
+            try:
+                geospatial_service.create_aoi_from_geometry(request.geometry, None, request.aoi_id)
+                logger.info(
+                    "Rehydrated AOI %s from request payload on cold instance",
+                    request.aoi_id
+                )
+                aoi = geospatial_service.get_aoi(request.aoi_id)
+            except Exception as create_err:  # pragma: no cover - defensive guard
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid AOI geometry supplied: {create_err}"
+                ) from create_err
+
         if not aoi:
             raise HTTPException(status_code=404, detail=f"AOI {request.aoi_id} not found")
         

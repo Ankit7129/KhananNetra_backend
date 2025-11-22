@@ -76,6 +76,7 @@ class SearchLocation(BaseModel):
 class AnalysisRequest(BaseModel):
     """Request model for starting analysis."""
     aoi_id: str = Field(..., description="AOI identifier")
+    geometry: Optional[AOIGeometry] = Field(default=None, description="Fallback geometry when AOI is not cached")
     analysis_type: str = Field(default="mining_detection", description="Type of analysis")
     parameters: Optional[Dict[str, Any]] = Field(default_factory=dict)
 

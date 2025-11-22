@@ -59,7 +59,8 @@ class GeospatialService:
             return False
     
     def create_aoi_from_geometry(self, geometry: AOIGeometry, 
-                               properties: Optional[AOIProperties] = None) -> Tuple[str, AOIFeature]:
+                               properties: Optional[AOIProperties] = None,
+                               aoi_id: Optional[str] = None) -> Tuple[str, AOIFeature]:
         """Create an AOI from geometry data."""
         
         # Validate coordinates
@@ -67,7 +68,7 @@ class GeospatialService:
             raise ValueError("Invalid coordinate structure")
             
         # Generate unique ID
-        aoi_id = str(uuid.uuid4())
+        target_aoi_id = aoi_id or str(uuid.uuid4())
         
         # Create properties if not provided
         if properties is None:
@@ -92,9 +93,9 @@ class GeospatialService:
         )
         
         # Store AOI
-        self.aois[aoi_id] = aoi_feature
+        self.aois[target_aoi_id] = aoi_feature
         
-        return aoi_id, aoi_feature
+        return target_aoi_id, aoi_feature
     
     def get_bounding_box(self, geometry: AOIGeometry) -> BoundingBox:
         """Calculate bounding box for geometry."""
