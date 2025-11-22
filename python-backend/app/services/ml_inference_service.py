@@ -366,6 +366,13 @@ class MLInferenceService:
             'model_size_mb': os.path.getsize(self.model_path) / (1024*1024) if os.path.exists(self.model_path) else 0
         }
 
+    def preload_model(self) -> dict:
+        """Ensure model artifacts are present before handling requests."""
+        info = self.get_model_info()
+        if not info['model_exists']:
+            raise FileNotFoundError(f"Model file missing at {self.model_path}")
+        return info
+
 
 # Singleton helper
 _ml_service = None

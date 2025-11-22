@@ -314,6 +314,56 @@ router.get('/analysis/:analysisId', optionalProtect, async (req, res) => {
       }
     }
     
+    if (response.status === 404) {
+      console.warn(`⚠️  Python backend returned 404 for analysis ${analysisId} - attempting to serve cached history`);
+
+      try {
+        const historyQuery = userId ? { analysisId, userId } : { analysisId };
+        const historyRecord = await AnalysisHistory.findOne(historyQuery).lean();
+
+        if (historyRecord) {
+          const sanitizeTiles = (tiles = []) => tiles.map((tile) => {
+            const {
+              image_base64,
+              probability_map_base64,
+              thumbnail,
+              ...rest
+            } = tile || {};
+            return rest;
+          });
+
+          const sanitizeResults = (results = {}) => {
+            if (!results) return results;
+            const cleaned = { ...results };
+            if (Array.isArray(cleaned.tiles)) {
+              cleaned.tiles = sanitizeTiles(cleaned.tiles);
+            }
+            return cleaned;
+          };
+
+          const completedAt = historyRecord.endTime || historyRecord.completedAt || historyRecord.updatedAt;
+          const fallbackPayload = {
+            analysis_id: historyRecord.analysisId,
+            status: historyRecord.status || 'unknown',
+            message: historyRecord.status === 'completed'
+              ? 'Served from cached history record'
+              : 'Analysis not found in live Python backend; using cached snapshot',
+            progress: historyRecord.status === 'completed' ? 100 : historyRecord.progress || 0,
+            results: sanitizeResults(historyRecord.results),
+            completed_at: completedAt ? new Date(completedAt).toISOString() : undefined,
+            history: {
+              source: 'mongo-cache',
+              updated_at: historyRecord.updatedAt
+            }
+          };
+
+          return res.status(200).json(fallbackPayload);
+        }
+      } catch (historyLookupError) {
+        console.error('⚠️  Failed to load cached history fallback:', historyLookupError.message);
+      }
+    }
+
     res.status(response.status).json(response.data);
   } catch (error) {
     console.error('❌ Analysis status error:', error.message);

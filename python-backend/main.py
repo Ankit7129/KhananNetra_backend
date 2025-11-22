@@ -58,6 +58,20 @@ async def lifespan(app: FastAPI):
         
         # Store model path in app state for use by services
         app.state.model_path = model_path
+
+        # Warm up inference service so the model is ready before first request
+        try:
+            import asyncio
+            from app.services.ml_inference_service import get_ml_service
+
+            async def preload_ml_service() -> None:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, lambda: get_ml_service().preload_model())
+
+            await preload_ml_service()
+            logger.info("✅ ML inference service preloaded successfully")
+        except Exception as preload_error:
+            logger.warning(f"⚠️  Failed to preload ML service: {preload_error}")
         
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
