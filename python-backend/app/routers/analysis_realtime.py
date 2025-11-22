@@ -792,42 +792,135 @@ async def process_analysis_realtime(analysis_id: str, aoi_geometry: AOIGeometry)
 
         detections = []
         detection_id = 1
-        
+
         for tile_pred in tile_predictions:
-            if tile_pred['confidence'] < 0.3:
-                # Skip tiles with low confidence
-                continue
-            
-            # Get tile bounds [[min_lon, min_lat], [max_lon, max_lat], ...]
-            bounds = tile_pred['bounds']
-            min_lon = min([b[0] for b in bounds])
-            max_lon = max([b[0] for b in bounds])
-            min_lat = min([b[1] for b in bounds])
-            max_lat = max([b[1] for b in bounds])
-            
-            # Calculate center of tile
-            center_lon = (min_lon + max_lon) / 2
-            center_lat = (min_lat + max_lat) / 2
-            
-            # Calculate tile area in m²
-            # Approximate: 1 degree ≈ 111 km at equator
-            width_km = (max_lon - min_lon) * 111 * cos(radians(center_lat))
-            height_km = (max_lat - min_lat) * 111
-            area_m2 = int(width_km * height_km * 1_000_000)
-            
-            detections.append({
-                "id": detection_id,
-                "latitude": center_lat,
-                "longitude": center_lon,
-                "confidence": tile_pred['confidence'],
-                "tile_id": tile_pred['tile_id'],
-                "area_m2": area_m2,
-                "bounds": bounds
-            })
-            
-            detection_id += 1
+            blocks = tile_pred.get('mine_blocks') or []
+
+            if blocks:
+                for block in blocks:
+                    props = block.get('properties', {}) if isinstance(block, dict) else {}
+
+                    centroid_lat = props.get('centroid_lat')
+                    centroid_lon = props.get('centroid_lon')
+                    label_position = props.get('label_position') or []
+
+                    if centroid_lat is None or centroid_lon is None:
+                        if len(label_position) == 2:
+                            centroid_lon, centroid_lat = label_position
+                        else:
+                            # Fallback to tile centre if centroid missing
+                            bounds = tile_pred.get('bounds') or []
+                            if bounds:
+                                min_lon = min(b[0] for b in bounds)
+                                max_lon = max(b[0] for b in bounds)
+                                min_lat = min(b[1] for b in bounds)
+                                max_lat = max(b[1] for b in bounds)
+                                centroid_lon = (min_lon + max_lon) / 2
+                                centroid_lat = (min_lat + max_lat) / 2
+
+                    bbox = props.get('bbox')
+                    if bbox and len(bbox) == 4:
+                        min_lon, min_lat, max_lon, max_lat = bbox
+                        bounds = [
+                            [float(min_lon), float(min_lat)],
+                            [float(max_lon), float(min_lat)],
+                            [float(max_lon), float(max_lat)],
+                            [float(min_lon), float(max_lat)],
+                            [float(min_lon), float(min_lat)]
+                        ]
+                    else:
+                        bounds = tile_pred.get('bounds') or []
+
+                    area_m2 = props.get('area_m2')
+                    if area_m2 is None:
+                        # Approximate area using tile bounds if geo area missing
+                        tile_bounds = tile_pred.get('bounds') or []
+                        if tile_bounds and len(tile_bounds) >= 4:
+                            min_lon = min(b[0] for b in tile_bounds)
+                            max_lon = max(b[0] for b in tile_bounds)
+                            min_lat = min(b[1] for b in tile_bounds)
+                            max_lat = max(b[1] for b in tile_bounds)
+                            center_lat_for_area = (min_lat + max_lat) / 2
+                            width_km = (max_lon - min_lon) * 111 * cos(radians(center_lat_for_area))
+                            height_km = (max_lat - min_lat) * 111
+                            area_m2 = float(width_km * height_km * 1_000_000)
+                        else:
+                            area_m2 = 0.0
+
+                    detection_id_str = props.get('block_id')
+                    if not detection_id_str:
+                        detection_id_str = f"block-{tile_pred.get('tile_id', 'mosaic')}-{detection_id}"
+
+                    detections.append({
+                        "id": detection_id_str,
+                        "latitude": float(centroid_lat) if centroid_lat is not None else None,
+                        "longitude": float(centroid_lon) if centroid_lon is not None else None,
+                        "confidence": float(props.get('avg_confidence', tile_pred.get('confidence', 0.0))),
+                        "tile_id": tile_pred.get('tile_id'),
+                        "area_m2": float(area_m2) if area_m2 is not None else 0.0,
+                        "bounds": bounds
+                    })
+
+                    detection_id += 1
+            else:
+                # Fallback: treat the entire tile as a single detection when mining is flagged
+                if not tile_pred.get('mining_detected'):
+                    continue
+
+                confidence_val = float(tile_pred.get('confidence') or 0.0)
+                if confidence_val < 0.3:
+                    continue
+
+                bounds = tile_pred.get('bounds') or []
+                if bounds:
+                    min_lon = min([b[0] for b in bounds])
+                    max_lon = max([b[0] for b in bounds])
+                    min_lat = min([b[1] for b in bounds])
+                    max_lat = max([b[1] for b in bounds])
+
+                    center_lon = (min_lon + max_lon) / 2
+                    center_lat = (min_lat + max_lat) / 2
+
+                    width_km = (max_lon - min_lon) * 111 * cos(radians(center_lat))
+                    height_km = (max_lat - min_lat) * 111
+                    area_m2 = float(width_km * height_km * 1_000_000)
+                else:
+                    center_lon = None
+                    center_lat = None
+                    area_m2 = 0.0
+
+                detections.append({
+                    "id": f"tile-{tile_pred.get('tile_id')}-{detection_id}",
+                    "latitude": center_lat,
+                    "longitude": center_lon,
+                    "confidence": confidence_val,
+                    "tile_id": tile_pred.get('tile_id'),
+                    "area_m2": area_m2,
+                    "bounds": bounds
+                })
+
+                detection_id += 1
         
         print(f"✅ Found {len(detections)} potential mining areas across {len(tile_predictions)} tiles")
+
+        tiles_with_mining = sum(1 for tile in tile_predictions if tile.get('mining_detected'))
+        detection_area_total_m2 = sum(float(det.get('area_m2') or 0.0) for det in detections)
+
+        if detection_area_total_m2 and detection_area_total_m2 > 0:
+            summary_payload["mining_area_m2"] = float(detection_area_total_m2)
+            summary_payload["mining_area_ha"] = float(detection_area_total_m2 / 10_000)
+            summary_payload["mining_area_km2"] = float(detection_area_total_m2 / 1_000_000)
+            total_area_m2 = float(detection_area_total_m2)
+        else:
+            base_area_m2 = float(summary_payload.get("mining_area_m2") or 0.0)
+            summary_payload["mining_area_ha"] = base_area_m2 / 10_000
+            summary_payload["mining_area_km2"] = base_area_m2 / 1_000_000
+
+        summary_payload["tiles_with_detections"] = int(tiles_with_mining)
+        analysis_results[analysis_id]["tiles_with_mining"] = tiles_with_mining
+        analysis_results[analysis_id]["total_mining_area_m2"] = float(summary_payload.get("mining_area_m2", 0.0))
+        analysis_results[analysis_id]["total_mining_area_ha"] = float(summary_payload.get("mining_area_ha", 0.0))
+        analysis_results[analysis_id]["mining_coverage_percentage"] = float(mining_percentage)
         
         # Step 8: Merge adjacent polygons across tiles (95%)
         print(f"\n{'='*50}")
@@ -868,6 +961,61 @@ async def process_analysis_realtime(analysis_id: str, aoi_geometry: AOIGeometry)
         except Exception as merge_error:
             print(f"⚠️  Polygon merging failed: {merge_error}")
             # Continue without merging - individual tile polygons will be used
+
+        tiles_output = analysis_results[analysis_id].get("tiles", [])
+        confidence_values = [float(tile.get('confidence') or 0.0) for tile in tile_predictions if tile.get('confidence') is not None]
+        coverage_values = [float(tile.get('mining_percentage') or 0.0) for tile in tile_predictions if tile.get('mining_percentage') is not None]
+
+        statistics = {
+            "avgConfidence": float(sum(confidence_values) / len(confidence_values)) if confidence_values else 0.0,
+            "maxConfidence": float(max(confidence_values)) if confidence_values else 0.0,
+            "minConfidence": float(min(confidence_values)) if confidence_values else 0.0,
+            "coveragePercentage": float(sum(coverage_values) / len(coverage_values)) if coverage_values else float(mining_percentage)
+        }
+
+        block_tracking_blocks = []
+        persistent_count = 0
+        for tile_pred in tile_predictions:
+            for block in tile_pred.get('mine_blocks') or []:
+                props = block.get('properties', {}) if isinstance(block, dict) else {}
+                block_tracking_blocks.append({
+                    "blockId": props.get('block_id'),
+                    "tileId": tile_pred.get('tile_id'),
+                    "persistentId": props.get('persistent_id'),
+                    "areaSquareMeters": float(props.get('area_m2')) if props.get('area_m2') is not None else None,
+                    "avgConfidence": float(props.get('avg_confidence')) if props.get('avg_confidence') is not None else None
+                })
+                if props.get('persistent_id'):
+                    persistent_count += 1
+
+        block_tracking = {
+            "summary": {
+                "total": len(block_tracking_blocks),
+                "withPersistentIds": persistent_count
+            },
+            "blocks": block_tracking_blocks
+        }
+
+        total_mining_area_m2 = float(summary_payload.get("mining_area_m2") or 0.0)
+        results_payload = {
+            "totalTiles": int(source_tile_total),
+            "tilesProcessed": int(total_tiles_processed),
+            "tilesWithMining": int(summary_payload.get("tiles_with_detections", 0)),
+            "detections": detections,
+            "detectionCount": len(detections),
+            "totalMiningArea": {
+                "m2": total_mining_area_m2,
+                "hectares": total_mining_area_m2 / 10_000,
+                "km2": total_mining_area_m2 / 1_000_000
+            },
+            "summary": summary_payload,
+            "statistics": statistics,
+            "tiles": tiles_output,
+            "mergedBlocks": analysis_results[analysis_id].get("merged_blocks"),
+            "blockTracking": block_tracking
+        }
+
+        analysis_results[analysis_id]["results"] = results_payload
         
         # Step 9: Complete (100%)
         print(f"\n{'='*50}")

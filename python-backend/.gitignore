@@ -49,3 +49,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+/scripts
+app/models/saved_model_export

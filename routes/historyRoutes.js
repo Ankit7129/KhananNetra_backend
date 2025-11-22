@@ -65,6 +65,279 @@ const saveDevHistoryRecord = (record) => {
   }
 };
 
+const parseTimestampValue = (value) => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const milliseconds = value > 1e12 ? value : value * 1000;
+    const dateFromNumber = new Date(milliseconds);
+    return Number.isNaN(dateFromNumber.getTime()) ? null : dateFromNumber;
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    const numericCandidate = Number(trimmed);
+    if (Number.isFinite(numericCandidate)) {
+      const milliseconds = numericCandidate > 1e12 ? numericCandidate : numericCandidate * 1000;
+      const numericDate = new Date(milliseconds);
+      if (!Number.isNaN(numericDate.getTime())) {
+        return numericDate;
+      }
+    }
+
+    const parsed = new Date(trimmed);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  return null;
+};
+
+const coerceSecondsValue = (value, divisor = 1) => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const normalize = (candidate) => {
+    if (!Number.isFinite(candidate)) {
+      return null;
+    }
+    const scaled = divisor !== 0 ? candidate / divisor : candidate;
+    return Number.isFinite(scaled) && scaled >= 0 ? scaled : null;
+  };
+
+  if (typeof value === 'number') {
+    return normalize(value);
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const parsed = Number.parseFloat(trimmed.replace(/,/g, ''));
+    return normalize(parsed);
+  }
+
+  return null;
+};
+
+const getValueByPath = (source, path) => {
+  if (!source || typeof source !== 'object') {
+    return undefined;
+  }
+
+  return path.split('.').reduce((acc, key) => {
+    if (acc && typeof acc === 'object' && Object.prototype.hasOwnProperty.call(acc, key)) {
+      return acc[key];
+    }
+    return undefined;
+  }, source);
+};
+
+const deriveTimingInfo = (resultsPayload = {}, metadataPayload = {}) => {
+  const results = resultsPayload && typeof resultsPayload === 'object' ? resultsPayload : {};
+  const metadata = metadataPayload && typeof metadataPayload === 'object' ? metadataPayload : {};
+  const summary = results.summary && typeof results.summary === 'object' ? results.summary : {};
+  const statistics = results.statistics && typeof results.statistics === 'object' ? results.statistics : {};
+
+  const context = { metadata, results, summary, statistics };
+
+  const pickFirstTimestamp = (paths) => {
+    for (const path of paths) {
+      const candidateDate = parseTimestampValue(getValueByPath(context, path));
+      if (candidateDate) {
+        return candidateDate;
+      }
+    }
+    return null;
+  };
+
+  const pickFirstDuration = (specs) => {
+    for (const [path, divisor = 1] of specs) {
+      const candidate = coerceSecondsValue(getValueByPath(context, path), divisor);
+      if (candidate !== null && candidate !== undefined) {
+        return candidate;
+      }
+    }
+    return null;
+  };
+
+  const startPaths = [
+    'metadata.startTime',
+    'metadata.start_time',
+    'metadata.startedAt',
+    'metadata.started_at',
+    'metadata.analysisStart',
+    'metadata.analysis_start',
+    'metadata.analysisStartedAt',
+    'metadata.analysis_started_at',
+    'metadata.timing.startTime',
+    'metadata.timing.start_time',
+    'metadata.timing.startedAt',
+    'metadata.timing.started_at',
+    'metadata.timeline.start',
+    'metadata.timeline.startedAt',
+    'metadata.timeline.started_at',
+    'metadata.runtime.start',
+    'results.startTime',
+    'results.start_time',
+    'results.startedAt',
+    'results.started_at',
+    'results.createdAt',
+    'results.created_at',
+    'summary.startTime',
+    'summary.start_time',
+    'summary.startedAt',
+    'summary.started_at',
+    'summary.analysisStartTime',
+    'statistics.startTime',
+    'statistics.start_time',
+    'statistics.startedAt',
+    'statistics.started_at',
+    'statistics.processingStartedAt',
+    'statistics.processing_started_at'
+  ];
+
+  const endPaths = [
+    'metadata.completedAt',
+    'metadata.completed_at',
+    'metadata.endTime',
+    'metadata.end_time',
+    'metadata.finishedAt',
+    'metadata.finished_at',
+    'metadata.analysisCompletedAt',
+    'metadata.analysis_completed_at',
+    'metadata.analysisEnd',
+    'metadata.analysis_end',
+    'metadata.timing.endTime',
+    'metadata.timing.end_time',
+    'metadata.timing.completedAt',
+    'metadata.timing.completed_at',
+    'metadata.timeline.end',
+    'metadata.timeline.completedAt',
+    'metadata.timeline.completed_at',
+    'metadata.runtime.end',
+    'results.endTime',
+    'results.end_time',
+    'results.completedAt',
+    'results.completed_at',
+    'results.finishedAt',
+    'results.finished_at',
+    'summary.endTime',
+    'summary.end_time',
+    'summary.completedAt',
+    'summary.completed_at',
+    'summary.finishedAt',
+    'summary.finished_at',
+    'summary.analysisCompletedAt',
+    'statistics.endTime',
+    'statistics.end_time',
+    'statistics.completedAt',
+    'statistics.completed_at',
+    'statistics.finishedAt',
+    'statistics.finished_at'
+  ];
+
+  const durationSpecs = [
+    ['metadata.processingTimeSeconds'],
+    ['metadata.processing_time_seconds'],
+    ['metadata.processingTimeMs', 1000],
+    ['metadata.processing_time_ms', 1000],
+    ['metadata.runtimeSeconds'],
+    ['metadata.runtime_seconds'],
+    ['metadata.runtimeMs', 1000],
+    ['metadata.runtime_ms', 1000],
+    ['metadata.analysisDurationSeconds'],
+    ['metadata.analysis_duration_seconds'],
+    ['metadata.analysisDurationMs', 1000],
+    ['metadata.analysis_duration_ms', 1000],
+    ['metadata.durationSeconds'],
+    ['metadata.duration_seconds'],
+    ['metadata.durationMs', 1000],
+    ['metadata.duration_ms', 1000],
+    ['results.durationSeconds'],
+    ['results.duration_seconds'],
+    ['results.runtimeSeconds'],
+    ['results.runtime_seconds'],
+    ['results.processingTimeSeconds'],
+    ['results.processing_time_seconds'],
+    ['results.processingTimeMs', 1000],
+    ['results.processing_time_ms', 1000],
+    ['summary.durationSeconds'],
+    ['summary.duration_seconds'],
+    ['summary.runtimeSeconds'],
+    ['summary.runtime_seconds'],
+    ['summary.runtimeMs', 1000],
+    ['summary.runtime_ms', 1000],
+    ['summary.processingSeconds'],
+    ['summary.processing_seconds'],
+    ['summary.processingMs', 1000],
+    ['summary.processing_ms', 1000],
+    ['statistics.durationSeconds'],
+    ['statistics.duration_seconds'],
+    ['statistics.runtimeSeconds'],
+    ['statistics.runtime_seconds'],
+    ['statistics.runtimeMs', 1000],
+    ['statistics.runtime_ms', 1000],
+    ['statistics.processingTimeSeconds'],
+    ['statistics.processing_time_seconds'],
+    ['statistics.processingTimeMs', 1000],
+    ['statistics.processing_time_ms', 1000]
+  ];
+
+  let startTime = pickFirstTimestamp(startPaths);
+  let endTime = pickFirstTimestamp(endPaths);
+  let durationSeconds = pickFirstDuration(durationSpecs);
+
+  if (startTime && endTime) {
+    const diffSeconds = (endTime.getTime() - startTime.getTime()) / 1000;
+    if (Number.isFinite(diffSeconds) && diffSeconds >= 0.5) {
+      durationSeconds = Math.round(diffSeconds);
+    } else if (durationSeconds && diffSeconds < 0) {
+      endTime = new Date(startTime.getTime() + Math.round(durationSeconds) * 1000);
+    }
+  }
+
+  if (!startTime && endTime && durationSeconds && durationSeconds > 0) {
+    startTime = new Date(endTime.getTime() - Math.round(durationSeconds) * 1000);
+  }
+
+  if (startTime && !endTime && durationSeconds && durationSeconds > 0) {
+    endTime = new Date(startTime.getTime() + Math.round(durationSeconds) * 1000);
+  }
+
+  if (!startTime) {
+    startTime = new Date();
+  }
+
+  if (!endTime) {
+    endTime = durationSeconds && durationSeconds > 0
+      ? new Date(startTime.getTime() + Math.round(durationSeconds) * 1000)
+      : new Date(startTime.getTime());
+  }
+
+  if (durationSeconds === null || durationSeconds === undefined || durationSeconds < 0) {
+    const diffSeconds = (endTime.getTime() - startTime.getTime()) / 1000;
+    durationSeconds = Number.isFinite(diffSeconds) && diffSeconds >= 0 ? Math.round(diffSeconds) : 0;
+  }
+
+  return {
+    startTime,
+    endTime,
+    durationSeconds: Number.isFinite(durationSeconds) && durationSeconds >= 0 ? Math.round(durationSeconds) : 0
+  };
+};
+
 const sanitizeTileImages = (tiles = [], includeImages = false) => {
   if (includeImages) {
     return tiles;
@@ -424,68 +697,11 @@ router.post('/', async (req, res) => {
 
     if (!req.user && shouldBypassAuth()) {
       console.warn('⚠️  Save history requested without auth - storing in in-memory dev history store');
-      const parseTimestamp = (value) => {
-        if (!value) return null;
-        const date = new Date(value);
-        return Number.isNaN(date.getTime()) ? null : date;
-      };
+      const rawResults = results?.results && typeof results.results === 'object'
+        ? results.results
+        : results || {};
 
-      const startTimeDate = parseTimestamp(metadata?.startTime)
-        || parseTimestamp(results?.start_time)
-        || parseTimestamp(results?.startTime)
-        || parseTimestamp(results?.started_at)
-        || parseTimestamp(results?.created_at)
-        || new Date();
-
-      const endTimeDate = parseTimestamp(metadata?.completedAt)
-        || parseTimestamp(results?.completed_at)
-        || parseTimestamp(results?.completedAt)
-        || parseTimestamp(results?.end_time)
-        || parseTimestamp(results?.endTime)
-        || new Date();
-
-      const coerceSeconds = (value, divisor = 1) => {
-        if (value === undefined || value === null) return null;
-        const numeric = typeof value === 'string' ? Number.parseFloat(value) : Number(value);
-        if (!Number.isFinite(numeric) || numeric <= 0) return null;
-        return numeric / divisor;
-      };
-
-      const fallbackDurationSeconds = [
-        coerceSeconds(metadata?.processingTimeSeconds),
-        coerceSeconds(metadata?.processingTimeMs, 1000),
-        coerceSeconds(metadata?.runtimeSeconds),
-        coerceSeconds(metadata?.runtimeMs, 1000),
-        coerceSeconds(results?.processing_time_seconds),
-        coerceSeconds(results?.processing_time_ms, 1000),
-        coerceSeconds(results?.runtime_seconds),
-        coerceSeconds(results?.runtime_ms, 1000),
-        coerceSeconds(results?.summary?.runtime_seconds),
-        coerceSeconds(results?.summary?.processing_seconds),
-        coerceSeconds(results?.summary?.runtime_ms, 1000),
-        coerceSeconds(results?.statistics?.runtimeSeconds),
-        coerceSeconds(results?.statistics?.processingTimeSeconds),
-        coerceSeconds(results?.statistics?.runtimeMs, 1000)
-      ].find((seconds) => seconds !== null) ?? null;
-
-      let durationSeconds = (() => {
-        const raw = Math.round((endTimeDate.getTime() - startTimeDate.getTime()) / 1000);
-        if (Number.isFinite(raw) && raw >= 0) {
-          return raw;
-        }
-        return 0;
-      })();
-
-      if (durationSeconds <= 0 && fallbackDurationSeconds !== null) {
-        durationSeconds = Math.round(fallbackDurationSeconds);
-      }
-
-      const adjustedEndTime = (() => {
-        if (durationSeconds > 0 && endTimeDate.getTime() <= startTimeDate.getTime()) {
-          return new Date(startTimeDate.getTime() + durationSeconds * 1000);
-        }
-        return endTimeDate;
-      })();
+      const { startTime, endTime, durationSeconds } = deriveTimingInfo(rawResults, metadata);
 
       const devRecord = {
         analysisId,
@@ -494,13 +710,24 @@ router.post('/', async (req, res) => {
         results,
         logs,
         metadata,
-        status: results?.status || 'completed',
-        startTime: startTimeDate.toISOString(),
-        endTime: adjustedEndTime.toISOString(),
-        completedAt: metadata?.completedAt || results?.completed_at || adjustedEndTime.toISOString(),
+        status: rawResults?.status || results?.status || 'completed',
+        startTime: startTime.toISOString(),
+        endTime: endTime.toISOString(),
+        completedAt: metadata?.completedAt
+          || rawResults?.completed_at
+          || rawResults?.completedAt
+          || endTime.toISOString(),
         duration: durationSeconds,
-        progress: typeof results?.progress === 'number' ? results.progress : 100,
-        currentStep: results?.current_step || results?.currentStep || 'completed',
+        progress: typeof rawResults?.progress === 'number'
+          ? rawResults.progress
+          : typeof results?.progress === 'number'
+            ? results.progress
+            : 100,
+        currentStep: rawResults?.current_step
+          || rawResults?.currentStep
+          || results?.current_step
+          || results?.currentStep
+          || 'completed',
         userId: 'dev-user',
         source: 'dev-memory-store'
       };
@@ -522,57 +749,93 @@ router.post('/', async (req, res) => {
     console.log(`📋 Analysis ID: ${analysisId}`);
     console.log(`👤 User ID: ${req.user._id}`);
     
-    // More robust field extraction
-    const tiles = results?.tiles || [];
-    const tilesWithMining = tiles.filter(t => t.mining_detected || t.miningDetected).length;
-    
-    // Calculate total mine blocks from multiple sources
-    let totalMineBlocks = 0;
-    let blockCountSource = 'unknown';
-    
-    // Try 1: Check merged_block_count (from Python merge_polygons)
-    if (results?.merged_block_count && results.merged_block_count > 0) {
-      totalMineBlocks = results.merged_block_count;
-      blockCountSource = 'merged_block_count';
-    }
-    // Try 2: Check merged_blocks.metadata.merged_block_count
-    else if (results?.merged_blocks?.metadata?.merged_block_count && results.merged_blocks.metadata.merged_block_count > 0) {
-      totalMineBlocks = results.merged_blocks.metadata.merged_block_count;
-      blockCountSource = 'metadata.merged_block_count';
-    }
-    // Try 3: Check merged_blocks.features (GeoJSON format)
-    else if (results?.merged_blocks?.features && Array.isArray(results.merged_blocks.features) && results.merged_blocks.features.length > 0) {
-      totalMineBlocks = results.merged_blocks.features.length;
-      blockCountSource = 'merged_blocks.features.length';
-    }
-    // Try 4: Check total_mine_blocks (old field name)
-    else if (results?.total_mine_blocks && results.total_mine_blocks > 0) {
-      totalMineBlocks = results.total_mine_blocks;
-      blockCountSource = 'total_mine_blocks';
-    }
-    
-    // Try 5: If merged blocks have 0 count, fall back to counting individual tile blocks
-    // This handles the case where some blocks were skipped due to low confidence
-    if (totalMineBlocks === 0 && tiles.length > 0) {
-      tiles.forEach(tile => {
-        if (tile.mine_blocks && Array.isArray(tile.mine_blocks)) {
-          totalMineBlocks += tile.mine_blocks.length;
+    // Normalize result structure
+    const rawResults = results?.results && typeof results.results === 'object'
+      ? results.results
+      : results || {};
+
+    const summary = rawResults.summary && typeof rawResults.summary === 'object'
+      ? rawResults.summary
+      : results?.summary && typeof results.summary === 'object'
+        ? results.summary
+        : {};
+
+    const tiles = Array.isArray(rawResults.tiles)
+      ? rawResults.tiles
+      : Array.isArray(results?.tiles)
+        ? results.tiles
+        : [];
+
+    const detections = Array.isArray(rawResults.detections)
+      ? rawResults.detections
+      : Array.isArray(results?.detections)
+        ? results.detections
+        : [];
+
+    const totalTiles = Number.isFinite(rawResults.totalTiles)
+      ? Number(rawResults.totalTiles)
+      : Number.isFinite(summary.total_tiles)
+        ? Number(summary.total_tiles)
+        : tiles.length;
+
+    const tilesWithMining = Number.isFinite(rawResults.tilesWithMining)
+      ? Number(rawResults.tilesWithMining)
+      : Number.isFinite(summary.tiles_with_detections)
+        ? Number(summary.tiles_with_detections)
+        : tiles.filter((tile) => tile.mining_detected || tile.miningDetected).length;
+
+    const detectionCount = Number.isFinite(rawResults.detectionCount)
+      ? Number(rawResults.detectionCount)
+      : Number.isFinite(summary.mine_block_count)
+        ? Number(summary.mine_block_count)
+        : detections.length;
+
+    const mergedBlocks = rawResults.mergedBlocks
+      ?? results?.mergedBlocks
+      ?? results?.merged_blocks
+      ?? null;
+
+    const totalMiningAreaM2 = (() => {
+      if (rawResults.totalMiningArea && typeof rawResults.totalMiningArea === 'object') {
+        const candidate = Number(rawResults.totalMiningArea.m2);
+        if (Number.isFinite(candidate) && candidate > 0) {
+          return candidate;
         }
-      });
-      if (totalMineBlocks > 0) {
-        blockCountSource = 'individual_tile_blocks (merged=0)';
       }
-    }
-    
+      if (typeof summary.mining_area_m2 === 'number' && Number.isFinite(summary.mining_area_m2)) {
+        return Number(summary.mining_area_m2);
+      }
+      if (mergedBlocks?.metadata?.total_area_m2 && Number.isFinite(mergedBlocks.metadata.total_area_m2)) {
+        return Number(mergedBlocks.metadata.total_area_m2);
+      }
+      return 0;
+    })();
+
+    const statistics = (() => {
+      const base = rawResults.statistics && typeof rawResults.statistics === 'object'
+        ? { ...rawResults.statistics }
+        : {};
+      if (base.avgConfidence === undefined && typeof summary.confidence === 'number') {
+        base.avgConfidence = summary.confidence * 100;
+      }
+      if (base.coveragePercentage === undefined && typeof summary.mining_percentage === 'number') {
+        base.coveragePercentage = summary.mining_percentage;
+      }
+      return {
+        avgConfidence: Number(base.avgConfidence) || 0,
+        maxConfidence: Number(base.maxConfidence) || 0,
+        minConfidence: Number(base.minConfidence) || 0,
+        coveragePercentage: Number(base.coveragePercentage) || 0
+      };
+    })();
+
     console.log(`📊 Results summary:`, {
-      status: results?.status,
-      totalTiles: results?.total_tiles || tiles.length,
+      status: rawResults.status ?? results?.status,
+      totalTiles,
       tilesWithMining,
-      totalMineBlocks: totalMineBlocks,
-      blockCountSource: blockCountSource,
-      mergedBlockCount: results?.merged_block_count,
-      mergedBlocksFeatures: results?.merged_blocks?.features?.length,
-      hasMergedBlocks: !!results?.merged_blocks,
+      detectionCount,
+      mergedBlockFeatures: mergedBlocks?.features?.length,
+      hasMergedBlocks: Boolean(mergedBlocks),
       hasResultsObject: !!results,
       resultKeys: results ? Object.keys(results).slice(0, 15) : []
     });
@@ -654,27 +917,27 @@ router.post('/', async (req, res) => {
       }
     }
 
-    const summary = results?.summary || {};
-    const summaryTotalTiles = summary.total_tiles ?? results?.total_tiles ?? tiles.length;
-    const summaryTilesWithMining = summary.tiles_with_detections ?? tilesWithMining;
-    const summaryMineBlocks = summary.mine_block_count ?? totalMineBlocks;
-    const summaryMiningAreaM2 = typeof summary.mining_area_m2 === 'number' ? summary.mining_area_m2 : null;
-    const summaryCoveragePct = typeof summary.mining_percentage === 'number' ? summary.mining_percentage : null;
-    const summaryConfidence = typeof summary.confidence === 'number' ? summary.confidence : null;
+    const summaryCoveragePct = typeof summary.mining_percentage === 'number'
+      ? summary.mining_percentage
+      : (typeof statistics.coveragePercentage === 'number' ? statistics.coveragePercentage : null);
+
+    const summaryConfidence = typeof summary.confidence === 'number'
+      ? summary.confidence * 100
+      : (typeof statistics.avgConfidence === 'number' ? statistics.avgConfidence : null);
 
     if (Object.keys(summary).length > 0) {
       console.log('📌 Summary snapshot:', {
-        totalTiles: summaryTotalTiles,
-        tilesWithDetections: summaryTilesWithMining,
-        mineBlockCount: summaryMineBlocks,
-        miningAreaHa: summaryMiningAreaM2 !== null ? summaryMiningAreaM2 / 10000 : null,
+        totalTiles,
+        tilesWithDetections: tilesWithMining,
+        mineBlockCount: detectionCount,
+        miningAreaHa: totalMiningAreaM2 / 10000,
         miningCoveragePct: summaryCoveragePct,
-        confidencePct: summaryConfidence !== null ? summaryConfidence * 100 : null
+        confidencePct: summaryConfidence
       });
     }
 
     // Process tiles to ensure mine_blocks have GeoJSON format
-    const processedTiles = (results?.tiles || []).map(tile => {
+    const processedTiles = tiles.map(tile => {
       const rawTileId = tile.tile_id ?? tile.id ?? tile.index;
       const tileId = rawTileId !== undefined && rawTileId !== null ? String(rawTileId) : undefined;
 
@@ -735,15 +998,15 @@ router.post('/', async (req, res) => {
     }
 
     // Log merged blocks structure
-    if (results?.merged_blocks) {
+    if (mergedBlocks) {
       console.log(`📦 Merged blocks:`, {
-        type: results.merged_blocks.type,
-        featuresCount: results.merged_blocks.features?.length || 0,
-        metadata: results.merged_blocks.metadata
+        type: mergedBlocks.type,
+        featuresCount: mergedBlocks.features?.length || 0,
+        metadata: mergedBlocks.metadata
       });
       
-      if (results.merged_blocks.features && results.merged_blocks.features.length > 0) {
-        const firstMerged = results.merged_blocks.features[0];
+      if (mergedBlocks.features && mergedBlocks.features.length > 0) {
+        const firstMerged = mergedBlocks.features[0];
         console.log(`   └─ First merged block:`, {
           blockId: firstMerged.properties?.block_id,
           name: firstMerged.properties?.name,
@@ -755,14 +1018,14 @@ router.post('/', async (req, res) => {
         });
         
         // Log total area from metadata
-        const metadataArea = results.merged_blocks.metadata?.total_area_m2;
+        const metadataArea = mergedBlocks.metadata?.total_area_m2;
         if (metadataArea) {
           console.log(`   └─ Metadata total area: ${(metadataArea / 10000).toFixed(2)} ha (${metadataArea} m²)`);
         }
       }
     }
 
-    const trackedBlocks = processedTiles.flatMap(tile => {
+    const fallbackTrackedBlocks = processedTiles.flatMap(tile => {
       if (!Array.isArray(tile.mine_blocks) || tile.mine_blocks.length === 0) {
         return [];
       }
@@ -792,7 +1055,7 @@ router.post('/', async (req, res) => {
       });
     });
 
-    trackedBlocks.sort((a, b) => {
+    fallbackTrackedBlocks.sort((a, b) => {
       if (a.sequence !== null && b.sequence !== null) {
         return a.sequence - b.sequence;
       }
@@ -802,15 +1065,21 @@ router.post('/', async (req, res) => {
       return 0;
     });
 
-    const blockTrackingSummary = {
-      total: trackedBlocks.length,
-      withPersistentIds: trackedBlocks.filter(block => !!block.persistentId).length
+    const canonicalBlockTracking = rawResults.blockTracking && typeof rawResults.blockTracking === 'object'
+      ? rawResults.blockTracking
+      : null;
+
+    const blockTrackingSummary = canonicalBlockTracking?.summary ?? {
+      total: fallbackTrackedBlocks.length,
+      withPersistentIds: fallbackTrackedBlocks.filter(block => !!block.persistentId).length
     };
 
+    const blockTracking = canonicalBlockTracking?.blocks && Array.isArray(canonicalBlockTracking.blocks)
+      ? canonicalBlockTracking.blocks
+      : fallbackTrackedBlocks;
+
     // Calculate duration
-    const startTime = new Date(results?.start_time || results?.created_at || Date.now());
-    const endTime = new Date();
-    const duration = Math.round((endTime.getTime() - startTime.getTime()) / 1000); // Duration in seconds
+    const { startTime, endTime, durationSeconds } = deriveTimingInfo(rawResults, metadata);
 
     // Create analysis record
     const analysisData = {
@@ -822,71 +1091,49 @@ router.post('/', async (req, res) => {
       status: 'completed',
       startTime,
       endTime,
-      duration,
+      duration: durationSeconds,
       currentStep: 'completed',
       progress: 100,
       logs: logs || [],
       results: {
-        totalTiles: summaryTotalTiles || processedTiles.length || 0,
-        tilesProcessed: summaryTotalTiles || results?.tiles_processed || processedTiles.length || 0,
-        tilesWithMining: summaryTilesWithMining || 0,
-        detectionCount: summaryMineBlocks || 0,  // Use summary first, fallback to robust computation
+        totalTiles: totalTiles || processedTiles.length || 0,
+        tilesProcessed: totalTiles || processedTiles.length || 0,
+        tilesWithMining: tilesWithMining || 0,
+        detectionCount,
         totalMiningArea: (() => {
-          // Calculate total mining area from multiple sources
-          let totalAreaM2 = summaryMiningAreaM2 ?? 0;
-          
-          // Prefer summary payload when provided
-          if (totalAreaM2 && totalAreaM2 > 0) {
-            // Already populated from summary
+          let totalAreaM2 = totalMiningAreaM2;
+
+          if ((!totalAreaM2 || totalAreaM2 <= 0) && Array.isArray(mergedBlocks?.features)) {
+            totalAreaM2 = mergedBlocks.features.reduce((sum, feature) => (
+              sum + (feature.properties?.area_m2 || 0)
+            ), 0);
           }
-          // Try 1: Use total_mining_area_ha from Python (converted)
-          else if (results?.total_mining_area_ha && results.total_mining_area_ha > 0) {
-            totalAreaM2 = results.total_mining_area_ha * 10000; // ha to m²
-          }
-          // Try 2: Use total_mining_area_m2 from Python
-          else if (results?.total_mining_area_m2 && results.total_mining_area_m2 > 0) {
-            totalAreaM2 = results.total_mining_area_m2;
-          }
-          // Try 3: Calculate from merged_blocks metadata
-          else if (results?.merged_blocks?.metadata?.total_area_m2 && results.merged_blocks.metadata.total_area_m2 > 0) {
-            totalAreaM2 = results.merged_blocks.metadata.total_area_m2;
-          }
-          // Try 4: Sum individual mine blocks from merged_blocks.features (if any)
-          else if (results?.merged_blocks?.features && Array.isArray(results.merged_blocks.features) && results.merged_blocks.features.length > 0) {
-            totalAreaM2 = results.merged_blocks.features.reduce((sum, feature) => {
-              return sum + (feature.properties?.area_m2 || 0);
+
+          if ((!totalAreaM2 || totalAreaM2 <= 0) && processedTiles.length > 0) {
+            totalAreaM2 = processedTiles.reduce((sum, tile) => {
+              if (!Array.isArray(tile.mine_blocks)) {
+                return sum;
+              }
+              return sum + tile.mine_blocks.reduce((innerSum, block) => (
+                innerSum + (block.properties?.area_m2 || 0)
+              ), 0);
             }, 0);
           }
-          // Try 5: If merged blocks are empty, sum from individual tile blocks
-          // This handles case where blocks were skipped due to low confidence
-          else if (tiles.length > 0) {
-            tiles.forEach(tile => {
-              if (tile.mine_blocks && Array.isArray(tile.mine_blocks)) {
-                tile.mine_blocks.forEach(block => {
-                  totalAreaM2 += block.properties?.area_m2 || 0;
-                });
-              }
-            });
-          }
-          
+
           return {
             m2: totalAreaM2,
             hectares: totalAreaM2 / 10000,
             km2: totalAreaM2 / 1000000
           };
         })(),
-        mergedBlocks: results?.merged_blocks || null,
+        mergedBlocks,
         tiles: processedTiles,
-        statistics: {
-          avgConfidence: summaryConfidence !== null ? summaryConfidence * 100 : (results?.avg_confidence || 0),
-          maxConfidence: results?.max_confidence || 0,
-          minConfidence: results?.min_confidence || 0,
-          coveragePercentage: summaryCoveragePct ?? (results?.mining_coverage_percentage || 0)
-        },
+        statistics,
         blockTracking: {
           summary: blockTrackingSummary,
-          blocks: trackedBlocks
+          blocks: blockTracking
         },
+        detections,
         summary: Object.keys(summary).length > 0 ? summary : undefined
       },
       metadata: metadata || {}
@@ -993,17 +1240,11 @@ router.put('/:analysisId/quantitative', async (req, res) => {
     const payload = req.body || {};
 
     console.log(`\n📦 Persisting quantitative analysis for ${analysisId}`);
+    const bypassAuth = shouldBypassAuth();
+    const persistedBy = req.user?._id ?? (bypassAuth ? 'dev-user' : null);
 
-    const analysis = await AnalysisHistory.findOne({
-      analysisId,
-      userId: req.user._id
-    });
-
-    if (!analysis) {
-      console.log('❌ Analysis not found or not owned by user');
-      return res.status(404).json({
-        error: 'Analysis not found'
-      });
+    if (!persistedBy) {
+      return res.status(401).json({ error: 'Authentication required' });
     }
 
     const coerceNumber = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null);
@@ -1154,7 +1395,7 @@ router.put('/:analysisId/quantitative', async (req, res) => {
         }))
       : [];
 
-    const quantitativeRecord = {
+    const buildQuantitativeRecord = (persistedById) => ({
       status: payload.status || 'completed',
       executedAt: payload.executedAt ? new Date(payload.executedAt) : new Date(),
       steps: sanitizedSteps,
@@ -1166,9 +1407,49 @@ router.put('/:analysisId/quantitative', async (req, res) => {
       metadata: {
         ...(payload.metadata || {}),
         persistedAt: new Date().toISOString(),
-        persistedBy: req.user._id,
+        persistedBy: persistedById,
       }
-    };
+    });
+
+    const quantitativeRecord = buildQuantitativeRecord(persistedBy);
+
+    if (!req.user && bypassAuth) {
+      console.warn('⚠️  DEV_ALLOW_OPEN_PYTHON_PROXY enabled - storing quantitative snapshot in dev memory store');
+      const existing = devHistoryStore.get(analysisId);
+
+      if (!existing) {
+        console.log('❌ Analysis not found in dev store');
+        return res.status(404).json({ error: 'Analysis not found' });
+      }
+
+      const updatedRecord = {
+        ...existing,
+        quantitativeAnalysis: quantitativeRecord,
+        updatedAt: new Date().toISOString()
+      };
+
+      devHistoryStore.set(analysisId, updatedRecord);
+
+      console.log(`✅ Quantitative analysis stored for ${analysisId} (dev memory store)`);
+
+      return res.json({
+        message: 'Quantitative analysis saved',
+        analysisId,
+        quantitativeAnalysis: quantitativeRecord
+      });
+    }
+
+    const analysis = await AnalysisHistory.findOne({
+      analysisId,
+      userId: req.user._id
+    });
+
+    if (!analysis) {
+      console.log('❌ Analysis not found or not owned by user');
+      return res.status(404).json({
+        error: 'Analysis not found'
+      });
+    }
 
     analysis.quantitativeAnalysis = quantitativeRecord;
     analysis.markModified('quantitativeAnalysis');
