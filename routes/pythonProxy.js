@@ -9,6 +9,17 @@ import multer from 'multer';
 import FormData from 'form-data';
 import AnalysisHistory from '../models/AnalysisHistory.js';
 import { protect } from '../middleware/auth.js';
+const shouldBypassAuth = () => (
+  process.env.NODE_ENV !== 'production' && process.env.DEV_ALLOW_OPEN_PYTHON_PROXY === 'true'
+);
+
+const optionalProtect = (req, res, next) => {
+  if (shouldBypassAuth()) {
+    console.warn('⚠️  DEV_ALLOW_OPEN_PYTHON_PROXY enabled - bypassing auth for python proxy route');
+    return next();
+  }
+  return protect(req, res, next);
+};
 
 const router = express.Router();
 
@@ -175,10 +186,10 @@ router.post('/aoi/upload', upload.single('file'), async (req, res) => {
  * Start analysis
  * POST /api/python/analysis/start
  */
-router.post('/analysis/start', protect, async (req, res) => {
+router.post('/analysis/start', optionalProtect, async (req, res) => {
   try {
     const { aoi_id, geometry } = req.body;
-    const userId = req.user._id; // From auth middleware
+    const userId = req.user?._id || null; // From auth middleware when available
 
     if (!aoi_id) {
       return res.status(400).json({
@@ -202,24 +213,26 @@ router.post('/analysis/start', protect, async (req, res) => {
     console.log('✅ Analysis started:', response.data.analysis_id);
 
     // Create analysis history record
-    try {
-      const historyRecord = new AnalysisHistory({
-        analysisId: response.data.analysis_id,
-        userId: userId,
-        aoiId: aoi_id,
-        aoiGeometry: geometry || {
-          type: 'Polygon',
-          coordinates: []
-        },
-        status: 'processing',
-        startTime: new Date()
-      });
+    if (userId) {
+      try {
+        const historyRecord = new AnalysisHistory({
+          analysisId: response.data.analysis_id,
+          userId,
+          aoiId: aoi_id,
+          aoiGeometry: geometry || {
+            type: 'Polygon',
+            coordinates: []
+          },
+          status: 'processing',
+          startTime: new Date()
+        });
 
-      await historyRecord.save();
-      console.log('📝 Analysis history record created:', response.data.analysis_id);
-    } catch (historyError) {
-      console.error('⚠️ Failed to create history record:', historyError.message);
-      // Don't fail the request if history saving fails
+        await historyRecord.save();
+        console.log('📝 Analysis history record created:', response.data.analysis_id);
+      } catch (historyError) {
+        console.error('⚠️ Failed to create history record:', historyError.message);
+        // Don't fail the request if history saving fails
+      }
     }
 
     res.json(response.data);
@@ -244,10 +257,10 @@ router.post('/analysis/start', protect, async (req, res) => {
  * Get analysis status
  * GET /api/python/analysis/:analysisId
  */
-router.get('/analysis/:analysisId', protect, async (req, res) => {
+router.get('/analysis/:analysisId', optionalProtect, async (req, res) => {
   try {
     const { analysisId } = req.params;
-    const userId = req.user._id;
+    const userId = req.user?._id;
     
     console.log(`📊 Fetching analysis status for: ${analysisId}`);
     console.log(`🔗 Python API URL: ${PYTHON_API_URL}/api/v1/analysis/${analysisId}`);
@@ -265,41 +278,40 @@ router.get('/analysis/:analysisId', protect, async (req, res) => {
     console.log(`✅ Analysis status retrieved: ${response.status}`);
     
     // Update history record with latest status
-    try {
-      const historyRecord = await AnalysisHistory.findOne({ analysisId, userId });
-      
-      if (historyRecord && response.data) {
-        const data = response.data;
+    if (userId) {
+      try {
+        const historyRecord = await AnalysisHistory.findOne({ analysisId, userId });
         
-        // Update status
-        if (data.status && data.status !== historyRecord.status) {
-          historyRecord.status = data.status;
+        if (historyRecord && response.data) {
+          const data = response.data;
+          
+          if (data.status && data.status !== historyRecord.status) {
+            historyRecord.status = data.status;
+          }
+          
+          if (data.message) {
+            await historyRecord.addLog(
+              data.status || 'processing',
+              data.message,
+              data.progress || 0,
+              'info'
+            );
+          }
+          
+          if (data.status === 'completed' && data.results) {
+            await historyRecord.markCompleted(data.results);
+          } else if (data.status === 'failed' && data.error) {
+            await historyRecord.markFailed(data.error);
+          } else {
+            await historyRecord.save();
+          }
+          
+          console.log('📝 History record updated:', analysisId);
         }
-        
-        // Add processing logs if available
-        if (data.message) {
-          await historyRecord.addLog(
-            data.status || 'processing',
-            data.message,
-            data.progress || 0,
-            'info'
-          );
-        }
-        
-        // If analysis is complete, save results
-        if (data.status === 'completed' && data.results) {
-          await historyRecord.markCompleted(data.results);
-        } else if (data.status === 'failed' && data.error) {
-          await historyRecord.markFailed(data.error);
-        } else {
-          await historyRecord.save();
-        }
-        
-        console.log('📝 History record updated:', analysisId);
+      } catch (historyError) {
+        console.error('⚠️ Failed to update history record:', historyError.message);
+        // Don't fail the request if history update fails
       }
-    } catch (historyError) {
-      console.error('⚠️ Failed to update history record:', historyError.message);
-      // Don't fail the request if history update fails
     }
     
     res.status(response.status).json(response.data);
@@ -394,10 +406,10 @@ router.post('/imagery/fetch', async (req, res) => {
  * Stop/Cancel an ongoing analysis
  * POST /api/python/analysis/:analysisId/stop
  */
-router.post('/analysis/:analysisId/stop', protect, async (req, res) => {
+router.post('/analysis/:analysisId/stop', optionalProtect, async (req, res) => {
   try {
     const { analysisId } = req.params;
-    const userId = req.user._id;
+    const userId = req.user?._id;
 
     console.log(`🛑 Stopping analysis: ${analysisId}`);
 
@@ -405,7 +417,7 @@ router.post('/analysis/:analysisId/stop', protect, async (req, res) => {
     let historyRecord = null;
     try {
       historyRecord = await AnalysisHistory.findOne({ analysisId, userId });
-      if (historyRecord) {
+      if (!historyRecord || !userId) {
         historyRecord.status = 'cancelled';
         historyRecord.endTime = new Date();
         historyRecord.duration = Math.floor((historyRecord.endTime - historyRecord.startTime) / 1000);

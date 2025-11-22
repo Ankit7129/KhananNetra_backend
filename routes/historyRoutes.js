@@ -4,13 +4,81 @@
  */
 
 import express from 'express';
+import axios from 'axios';
 import AnalysisHistory from '../models/AnalysisHistory.js';
 import { protect } from '../middleware/auth.js';
 
 const router = express.Router();
 
-// All routes require authentication
-router.use(protect);
+const shouldBypassAuth = () => (
+  process.env.NODE_ENV !== 'production' && process.env.DEV_ALLOW_OPEN_PYTHON_PROXY === 'true'
+);
+
+const getPythonBackendURL = () => {
+  if (process.env.PYTHON_BACKEND_URL) return process.env.PYTHON_BACKEND_URL;
+  if (process.env.PYTHON_API_URL) return process.env.PYTHON_API_URL;
+  const isDocker = process.env.DOCKER_ENV === 'true' || process.env.NODE_ENV === 'production';
+  return isDocker ? 'http://python-backend:8001' : 'http://localhost:8000';
+};
+
+const PYTHON_API_URL = getPythonBackendURL();
+
+const optionalProtect = (req, res, next) => {
+  if (shouldBypassAuth()) {
+    console.warn('⚠️  DEV_ALLOW_OPEN_PYTHON_PROXY enabled - bypassing auth for history route');
+    return next();
+  }
+  return protect(req, res, next);
+};
+
+router.use(optionalProtect);
+
+const DEV_HISTORY_LIMIT = Number.parseInt(process.env.DEV_HISTORY_LIMIT || '20', 10);
+const devHistoryStore = new Map();
+
+const getDevHistoryArray = () => Array.from(devHistoryStore.values()).sort((a, b) => {
+  const aTime = new Date(a.createdAt || a.startTime || 0).getTime();
+  const bTime = new Date(b.createdAt || b.startTime || 0).getTime();
+  return bTime - aTime;
+});
+
+const saveDevHistoryRecord = (record) => {
+  if (!record?.analysisId) {
+    return;
+  }
+
+  const nowIso = new Date().toISOString();
+  const normalized = {
+    ...record,
+    createdAt: record.createdAt || nowIso,
+    updatedAt: nowIso,
+    startTime: record.startTime || record.metadata?.startTime || nowIso
+  };
+
+  devHistoryStore.set(record.analysisId, normalized);
+
+  const maxEntries = Number.isFinite(DEV_HISTORY_LIMIT) && DEV_HISTORY_LIMIT > 0 ? DEV_HISTORY_LIMIT : 20;
+  while (devHistoryStore.size > maxEntries) {
+    const oldest = getDevHistoryArray().pop();
+    if (!oldest) break;
+    devHistoryStore.delete(oldest.analysisId);
+  }
+};
+
+const sanitizeTileImages = (tiles = [], includeImages = false) => {
+  if (includeImages) {
+    return tiles;
+  }
+  return tiles.map((tile) => {
+    const {
+      image_base64,
+      probability_map_base64,
+      thumbnail,
+      ...rest
+    } = tile;
+    return rest;
+  });
+};
 
 /**
  * GET /api/history
@@ -27,10 +95,72 @@ router.get('/', async (req, res) => {
       search
     } = req.query;
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const pageInt = Number.parseInt(page, 10) || 1;
+    const limitInt = Number.parseInt(limit, 10) || 20;
+    const sortDirection = sortOrder === 'asc' ? 1 : -1;
+
+    if (!req.user && shouldBypassAuth()) {
+      console.warn('⚠️  History list requested without auth - using in-memory dev store');
+      let records = getDevHistoryArray();
+
+      if (status) {
+        records = records.filter((rec) => rec.status === status);
+      }
+      if (search) {
+        const regex = new RegExp(search, 'i');
+        records = records.filter((rec) => regex.test(rec.analysisId) || regex.test(rec.aoiId || ''));
+      }
+
+      const deriveSortValue = (rec) => {
+        switch (sortBy) {
+          case 'duration':
+            return rec.duration ?? rec.metadata?.processingTimeMs ?? 0;
+          case 'detectionCount':
+            return rec.results?.detectionCount ?? rec.results?.mine_block_count ?? 0;
+          case 'startTime':
+          default:
+            return new Date(rec.startTime || rec.createdAt || 0).getTime();
+        }
+      };
+
+      records.sort((a, b) => {
+        const aValue = deriveSortValue(a);
+        const bValue = deriveSortValue(b);
+        if (aValue === bValue) return 0;
+        return aValue > bValue ? sortDirection : -sortDirection;
+      });
+
+      const total = records.length;
+      const pages = Math.ceil(total / limitInt);
+      const offset = (pageInt - 1) * limitInt;
+      const paged = records
+        .slice(offset, offset + limitInt)
+        .map((rec) => ({
+          ...rec,
+          results: rec.results ? {
+            ...rec.results,
+            tiles: sanitizeTileImages(rec.results.tiles || [], false)
+          } : rec.results
+        }));
+
+      return res.json({
+        analyses: paged,
+        pagination: {
+          page: pageInt,
+          limit: limitInt,
+          total,
+          pages
+        }
+      });
+    }
+
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    const skip = (pageInt - 1) * limitInt;
     const query = { userId: req.user._id };
 
-    // Apply filters
     if (status) query.status = status;
     if (search) {
       query.$or = [
@@ -40,24 +170,20 @@ router.get('/', async (req, res) => {
       ];
     }
 
-    // Build sort object based on sortBy field
     const sortMap = {
-      'startTime': 'startTime',
-      'duration': 'duration',
-      'detectionCount': 'results.detectionCount'
+      startTime: 'startTime',
+      duration: 'duration',
+      detectionCount: 'results.detectionCount'
     };
-    
+
     const sortField = sortMap[sortBy] || 'startTime';
-    const sortDirection = sortOrder === 'asc' ? 1 : -1;
     const sortObj = { [sortField]: sortDirection };
 
-    // Get total count for pagination
     const total = await AnalysisHistory.countDocuments(query);
 
-    // Get paginated results
     const analyses = await AnalysisHistory.find(query)
       .sort(sortObj)
-      .limit(parseInt(limit))
+      .limit(limitInt)
       .skip(skip)
       .select('-tiles.image_base64 -tiles.probability_map_base64 -logs')
       .lean();
@@ -65,10 +191,10 @@ router.get('/', async (req, res) => {
     res.json({
       analyses,
       pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
+        page: pageInt,
+        limit: limitInt,
         total,
-        pages: Math.ceil(total / parseInt(limit))
+        pages: Math.ceil(total / limitInt)
       }
     });
   } catch (error) {
@@ -86,6 +212,109 @@ router.get('/', async (req, res) => {
  */
 router.get('/stats', async (req, res) => {
   try {
+    if (!req.user && shouldBypassAuth()) {
+      console.warn('⚠️  History stats requested without auth - calculating from in-memory dev store');
+      const records = getDevHistoryArray();
+      const totals = records.reduce((acc, rec) => {
+        acc.totalAnalyses += 1;
+        if (rec.status === 'completed') acc.completedAnalyses += 1;
+        if (rec.status === 'failed') acc.failedAnalyses += 1;
+        if (rec.status === 'processing') acc.processingAnalyses += 1;
+
+        const detectionCount = rec.results?.detectionCount
+          ?? rec.results?.mine_block_count
+          ?? rec.results?.totalMiningArea?.detections
+          ?? 0;
+        acc.totalDetections += detectionCount;
+
+        const miningHa = rec.results?.totalMiningArea?.hectares
+          ?? rec.results?.mining_area_ha
+          ?? 0;
+        acc.totalMiningAreaHa += miningHa;
+
+        const startTimestamp = new Date(rec.startTime || rec.createdAt || 0).getTime();
+        if (startTimestamp > acc.lastAnalysisTimestamp) {
+          acc.lastAnalysisTimestamp = startTimestamp;
+        }
+
+        const durationSeconds = (() => {
+          if (typeof rec.duration === 'number' && Number.isFinite(rec.duration) && rec.duration > 0) {
+            return rec.duration;
+          }
+
+          const coerceSeconds = (value, divisor = 1) => {
+            if (value === undefined || value === null) return null;
+            const numeric = typeof value === 'string' ? Number.parseFloat(value) : Number(value);
+            if (!Number.isFinite(numeric) || numeric <= 0) return null;
+            return numeric / divisor;
+          };
+
+          const fallback = [
+            coerceSeconds(rec.metadata?.processingTimeSeconds),
+            coerceSeconds(rec.metadata?.processingTimeMs, 1000),
+            coerceSeconds(rec.metadata?.runtimeSeconds),
+            coerceSeconds(rec.metadata?.runtimeMs, 1000),
+            coerceSeconds(rec.results?.processing_time_seconds),
+            coerceSeconds(rec.results?.processing_time_ms, 1000),
+            coerceSeconds(rec.results?.runtime_seconds),
+            coerceSeconds(rec.results?.runtime_ms, 1000),
+            coerceSeconds(rec.results?.summary?.runtime_seconds),
+            coerceSeconds(rec.results?.summary?.processing_seconds),
+            coerceSeconds(rec.results?.summary?.runtime_ms, 1000),
+            coerceSeconds(rec.results?.statistics?.runtimeSeconds),
+            coerceSeconds(rec.results?.statistics?.processingTimeSeconds),
+            coerceSeconds(rec.results?.statistics?.runtimeMs, 1000)
+          ].find((seconds) => seconds !== null);
+
+          if (fallback) {
+            return fallback;
+          }
+
+          const start = new Date(rec.startTime || rec.createdAt || 0);
+          const end = new Date(rec.endTime || rec.completedAt || rec.updatedAt || start);
+          const diff = (end.getTime() - start.getTime()) / 1000;
+          return Number.isFinite(diff) && diff >= 0 ? diff : 0;
+        })();
+
+        if (durationSeconds > 0) {
+          acc.durationSum += durationSeconds;
+          acc.durationCount += 1;
+        }
+
+        return acc;
+      }, {
+        totalAnalyses: 0,
+        completedAnalyses: 0,
+        failedAnalyses: 0,
+        processingAnalyses: 0,
+        totalDetections: 0,
+        totalMiningAreaHa: 0,
+        lastAnalysisTimestamp: 0,
+        durationSum: 0,
+        durationCount: 0
+      });
+
+      const averageDuration = totals.durationCount > 0
+        ? totals.durationSum / totals.durationCount
+        : 0;
+
+      return res.json({
+        totalAnalyses: totals.totalAnalyses,
+        completedAnalyses: totals.completedAnalyses,
+        failedAnalyses: totals.failedAnalyses,
+        processingAnalyses: totals.processingAnalyses,
+        totalDetections: totals.totalDetections,
+        averageDuration,
+        lastAnalysisDate: totals.lastAnalysisTimestamp
+          ? new Date(totals.lastAnalysisTimestamp).toISOString()
+          : null
+      });
+    }
+
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+
     const stats = await AnalysisHistory.getUserStats(req.user._id);
     res.json(stats);
   } catch (error) {
@@ -105,6 +334,40 @@ router.get('/:analysisId', async (req, res) => {
   try {
     const { analysisId } = req.params;
     const { includeTileImages = 'false' } = req.query;
+
+    if (!req.user && shouldBypassAuth()) {
+      console.warn(`⚠️  History detail requested without auth - serving dev data for ${analysisId}`);
+      const stored = devHistoryStore.get(analysisId);
+      if (stored) {
+        return res.json({
+          ...stored,
+          results: stored.results ? {
+            ...stored.results,
+            tiles: sanitizeTileImages(
+              stored.results.tiles || [],
+              includeTileImages === 'true'
+            )
+          } : stored.results
+        });
+      }
+
+      try {
+        const response = await axios.get(`${PYTHON_API_URL}/api/v1/analysis/${analysisId}`, {
+          params: { includeTileImages }
+        });
+        return res.json(response.data);
+      } catch (proxyError) {
+        console.error('❌ Failed to proxy analysis detail:', proxyError.message);
+        const status = proxyError.response?.status || 404;
+        return res.status(status).json({
+          error: proxyError.response?.data || 'Analysis not found'
+        });
+      }
+    }
+
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
 
     console.log(`\n🔍 Fetching analysis from database: ${analysisId}`);
     console.log(`   └─ User ID: ${req.user._id}`);
@@ -158,6 +421,102 @@ router.post('/', async (req, res) => {
       metadata,
       force = false  // If true, allows overwriting existing analysis
     } = req.body;
+
+    if (!req.user && shouldBypassAuth()) {
+      console.warn('⚠️  Save history requested without auth - storing in in-memory dev history store');
+      const parseTimestamp = (value) => {
+        if (!value) return null;
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? null : date;
+      };
+
+      const startTimeDate = parseTimestamp(metadata?.startTime)
+        || parseTimestamp(results?.start_time)
+        || parseTimestamp(results?.startTime)
+        || parseTimestamp(results?.started_at)
+        || parseTimestamp(results?.created_at)
+        || new Date();
+
+      const endTimeDate = parseTimestamp(metadata?.completedAt)
+        || parseTimestamp(results?.completed_at)
+        || parseTimestamp(results?.completedAt)
+        || parseTimestamp(results?.end_time)
+        || parseTimestamp(results?.endTime)
+        || new Date();
+
+      const coerceSeconds = (value, divisor = 1) => {
+        if (value === undefined || value === null) return null;
+        const numeric = typeof value === 'string' ? Number.parseFloat(value) : Number(value);
+        if (!Number.isFinite(numeric) || numeric <= 0) return null;
+        return numeric / divisor;
+      };
+
+      const fallbackDurationSeconds = [
+        coerceSeconds(metadata?.processingTimeSeconds),
+        coerceSeconds(metadata?.processingTimeMs, 1000),
+        coerceSeconds(metadata?.runtimeSeconds),
+        coerceSeconds(metadata?.runtimeMs, 1000),
+        coerceSeconds(results?.processing_time_seconds),
+        coerceSeconds(results?.processing_time_ms, 1000),
+        coerceSeconds(results?.runtime_seconds),
+        coerceSeconds(results?.runtime_ms, 1000),
+        coerceSeconds(results?.summary?.runtime_seconds),
+        coerceSeconds(results?.summary?.processing_seconds),
+        coerceSeconds(results?.summary?.runtime_ms, 1000),
+        coerceSeconds(results?.statistics?.runtimeSeconds),
+        coerceSeconds(results?.statistics?.processingTimeSeconds),
+        coerceSeconds(results?.statistics?.runtimeMs, 1000)
+      ].find((seconds) => seconds !== null) ?? null;
+
+      let durationSeconds = (() => {
+        const raw = Math.round((endTimeDate.getTime() - startTimeDate.getTime()) / 1000);
+        if (Number.isFinite(raw) && raw >= 0) {
+          return raw;
+        }
+        return 0;
+      })();
+
+      if (durationSeconds <= 0 && fallbackDurationSeconds !== null) {
+        durationSeconds = Math.round(fallbackDurationSeconds);
+      }
+
+      const adjustedEndTime = (() => {
+        if (durationSeconds > 0 && endTimeDate.getTime() <= startTimeDate.getTime()) {
+          return new Date(startTimeDate.getTime() + durationSeconds * 1000);
+        }
+        return endTimeDate;
+      })();
+
+      const devRecord = {
+        analysisId,
+        aoiGeometry,
+        aoiBounds,
+        results,
+        logs,
+        metadata,
+        status: results?.status || 'completed',
+        startTime: startTimeDate.toISOString(),
+        endTime: adjustedEndTime.toISOString(),
+        completedAt: metadata?.completedAt || results?.completed_at || adjustedEndTime.toISOString(),
+        duration: durationSeconds,
+        progress: typeof results?.progress === 'number' ? results.progress : 100,
+        currentStep: results?.current_step || results?.currentStep || 'completed',
+        userId: 'dev-user',
+        source: 'dev-memory-store'
+      };
+
+      saveDevHistoryRecord(devRecord);
+
+      return res.status(201).json({
+        status: 'stored',
+        message: 'Analysis saved to in-memory dev history store',
+        analysis: devRecord
+      });
+    }
+
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
 
     console.log('\n📝 ==================== SAVE ANALYSIS REQUEST ====================');
     console.log(`📋 Analysis ID: ${analysisId}`);

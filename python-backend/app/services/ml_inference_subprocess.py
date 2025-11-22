@@ -418,41 +418,46 @@ def main():
         # Enhanced colormap for better visualization
         # Apply smooth gradients from dark blue (low) to bright cyan (high)
         prob_map_rgb = np.zeros((H, W, 3), dtype=np.uint8)
-        
-        # Create smooth color transitions
-        for i in range(H):
-            for j in range(W):
-                prob_val = pred_values[i, j]  # 0.0 to 1.0
-                
-                if prob_val < 0.1:
-                    # Very low: Dark blue/black
-                    prob_map_rgb[i, j] = [0, 0, int(prob_val * 10 * 50)]
-                elif prob_val < 0.3:
-                    # Low: Dark blue to blue
-                    t = (prob_val - 0.1) / 0.2
-                    prob_map_rgb[i, j] = [0, 0, int(50 + t * 100)]
-                elif prob_val < 0.7:
-                    # Medium: Blue to light blue
-                    t = (prob_val - 0.3) / 0.4
-                    prob_map_rgb[i, j] = [0, int(t * 150), int(150 + t * 105)]
-                else:
-                    # High: Light blue to bright cyan
-                    t = (prob_val - 0.7) / 0.3
-                    prob_map_rgb[i, j] = [int(t * 100), int(150 + t * 105), 255]
+        prob_values = np.clip(pred_values, 0.0, 1.0)
+
+        channel_r = prob_map_rgb[..., 0]
+        channel_g = prob_map_rgb[..., 1]
+        channel_b = prob_map_rgb[..., 2]
+
+        very_low_mask = prob_values < 0.1
+        if np.any(very_low_mask):
+            channel_b[very_low_mask] = np.clip(prob_values[very_low_mask] * 500.0, 0, 255).astype(np.uint8)
+
+        low_mask = (prob_values >= 0.1) & (prob_values < 0.3)
+        if np.any(low_mask):
+            t = (prob_values[low_mask] - 0.1) / 0.2
+            channel_b[low_mask] = np.clip(50 + t * 100.0, 0, 255).astype(np.uint8)
+
+        mid_mask = (prob_values >= 0.3) & (prob_values < 0.7)
+        if np.any(mid_mask):
+            t = (prob_values[mid_mask] - 0.3) / 0.4
+            channel_g[mid_mask] = np.clip(t * 150.0, 0, 255).astype(np.uint8)
+            channel_b[mid_mask] = np.clip(150.0 + t * 105.0, 0, 255).astype(np.uint8)
+
+        high_mask = prob_values >= 0.7
+        if np.any(high_mask):
+            t = np.clip((prob_values[high_mask] - 0.7) / 0.3, 0.0, 1.0)
+            channel_r[high_mask] = np.clip(t * 100.0, 0, 255).astype(np.uint8)
+            channel_g[high_mask] = np.clip(150.0 + t * 105.0, 0, 255).astype(np.uint8)
+            channel_b[high_mask] = 255
         
         # Convert RGB to BGR for OpenCV
         prob_map_bgr = cv2.cvtColor(prob_map_rgb, cv2.COLOR_RGB2BGR)
         
         # Add boundary contours to probability map for better visualization
-        binary_thresh = (pred_values > threshold).astype(np.uint8)
-        contours_viz, _ = cv2.findContours(binary_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        binary_thresh = (prob_values > threshold).astype(np.uint8)
+        contours_viz, _ = cv2.findContours(binary_thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         
         # Draw exact prediction boundaries in white
         cv2.drawContours(prob_map_bgr, contours_viz, -1, (255, 255, 255), thickness=1)
         
         # Draw threshold line contours in yellow (0.3 threshold)
-        thresh_line = (pred_values > threshold).astype(np.uint8)
-        thresh_contours, _ = cv2.findContours(thresh_line, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        thresh_contours, _ = cv2.findContours(binary_thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         cv2.drawContours(prob_map_bgr, thresh_contours, -1, (0, 255, 255), thickness=2)
         
         # Encode as high-quality PNG

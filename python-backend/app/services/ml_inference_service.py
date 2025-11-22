@@ -51,6 +51,10 @@ class MLInferenceService:
 
         self.input_size = 256
         self.expected_bands = 6
+        self.max_dimension = int(os.getenv('ML_MAX_MOSAIC_DIMENSION', '4096'))
+        self.max_pixels = int(os.getenv('ML_MAX_MOSAIC_PIXELS', '12000000'))  # ~3464²
+        print(f"   📐 Max mosaic dimension: {self.max_dimension}")
+        print(f"   🧮 Max mosaic pixels: {self.max_pixels:,}")
 
     def validate_input_data(self, image_data: np.ndarray) -> tuple:
         if not isinstance(image_data, np.ndarray):
@@ -89,6 +93,59 @@ class MLInferenceService:
                 print(f"   🔄 Converting from {image_data.dtype} to float32")
                 image_data = image_data.astype(np.float32)
 
+            original_height, original_width = image_data.shape[:2]
+            scale_x = 1.0
+            scale_y = 1.0
+
+            def apply_resize(new_height: float, new_width: float, reason: str) -> None:
+                nonlocal image_data, scale_x, scale_y
+                current_height, current_width = image_data.shape[:2]
+                target_height = max(self.input_size, int(round(new_height)))
+                target_width = max(self.input_size, int(round(new_width)))
+                target_height = max(1, target_height)
+                target_width = max(1, target_width)
+
+                if target_height == current_height and target_width == current_width:
+                    return
+
+                try:
+                    import cv2
+                    interpolation = cv2.INTER_AREA if target_height < current_height or target_width < current_width else cv2.INTER_LINEAR
+                    image_data = cv2.resize(
+                        image_data,
+                        (target_width, target_height),
+                        interpolation=interpolation
+                    )
+                except Exception:
+                    from skimage.transform import resize
+                    image_data = resize(
+                        image_data,
+                        (target_height, target_width, image_data.shape[2]),
+                        preserve_range=True,
+                        anti_aliasing=True
+                    ).astype(np.float32)
+
+                scale_x *= current_width / float(target_width)
+                scale_y *= current_height / float(target_height)
+                print(
+                    f"   📏 {reason}: {current_height}x{current_width} -> {target_height}x{target_width} "
+                    f"(scale_x={scale_x:.3f}, scale_y={scale_y:.3f})"
+                )
+
+            if max(original_height, original_width) > self.max_dimension:
+                dominant = float(max(original_height, original_width))
+                scale_factor = self.max_dimension / dominant
+                apply_resize(original_height * scale_factor, original_width * scale_factor, "Downscaled to ML_MAX_MOSAIC_DIMENSION")
+
+            height, width = image_data.shape[:2]
+            pixel_count = height * width
+            if pixel_count > self.max_pixels:
+                pixel_scale = (self.max_pixels / float(pixel_count)) ** 0.5
+                apply_resize(height * pixel_scale, width * pixel_scale, f"Downscaled to cap pixels at {self.max_pixels:,}")
+                height, width = image_data.shape[:2]
+
+            print(f"   🧮 Mosaic dimensions for inference: {height}x{width} ({height*width:,} px)")
+
             # Calculate Affine transform from tile bounds (CRITICAL for alignment)
             # This maps pixel coordinates to geographic coordinates (lat/lon)
             bounds = tile_data.get('bounds')
@@ -98,29 +155,46 @@ class MLInferenceService:
             if 'transform' in tile_data and tile_data['transform'] is not None:
                 transform = tile_data['transform']  # This is already a rasterio.Affine object
                 crs = tile_data.get('crs', 'EPSG:4326')
+                try:
+                    from rasterio.transform import Affine
+                    if not isinstance(transform, Affine):
+                        transform = Affine(*transform)
+                except Exception:
+                    transform = None
                 
-                # Format as string: "a,b,c,d,e,f|CRS"
-                transform_str = f"{transform.a},{transform.b},{transform.c},{transform.d},{transform.e},{transform.f}|{crs}"
-                georef_env['TILE_GEOREF'] = transform_str
-                
-                print(f"   🎯 Using EXACT transform from tile:")
-                print(f"   🗺️  Transform: |{transform.a:8.6f}, {transform.b:8.6f}, {transform.c:8.4f}|")
-                print(f"   🗺️            |{transform.d:8.6f}, {transform.e:8.6f}, {transform.f:8.4f}|")
-                print(f"   🗺️  CRS: {crs}")
+                if transform is not None and (scale_x != 1.0 or scale_y != 1.0):
+                    transform = transform * Affine.scale(scale_x, scale_y)
+                    print(
+                        f"   📐 Adjusted transform for scaled mosaic: "
+                        f"scale_x={scale_x:.3f}, scale_y={scale_y:.3f}"
+                    )
+
+                if transform is not None:
+                    # Format as string: "a,b,c,d,e,f|CRS"
+                    transform_str = (
+                        f"{transform.a},{transform.b},{transform.c},"
+                        f"{transform.d},{transform.e},{transform.f}|{crs}"
+                    )
+                    georef_env['TILE_GEOREF'] = transform_str
+
+                    print(f"   🎯 Using EXACT transform from tile:")
+                    print(f"   🗺️  Transform: |{transform.a:8.6f}, {transform.b:8.6f}, {transform.c:8.4f}|")
+                    print(f"   🗺️            |{transform.d:8.6f}, {transform.e:8.6f}, {transform.f:8.4f}|")
+                    print(f"   🗺️  CRS: {crs}")
+                else:
+                    print("   ⚠️  Unable to use provided transform after scaling")
                 
             # FALLBACK: Calculate from bounds if exact transform not available  
-            elif bounds and len(bounds) >= 4:
+            if ('transform' not in tile_data or tile_data.get('transform') is None or 'TILE_GEOREF' not in georef_env) and bounds and len(bounds) >= 4:
                 # Bounds format: [[min_lon, min_lat], [max_lon, min_lat], [max_lon, max_lat], [min_lon, max_lat], ...]
                 min_lon = min([b[0] for b in bounds])
                 max_lon = max([b[0] for b in bounds])
                 min_lat = min([b[1] for b in bounds])
                 max_lat = max([b[1] for b in bounds])
                 
-                H, W = image_data.shape[:2]
-                
                 # Calculate Affine transform coefficients
-                pixel_width = (max_lon - min_lon) / W
-                pixel_height = -(max_lat - min_lat) / H  # Negative for north-up orientation
+                pixel_width = (max_lon - min_lon) / width
+                pixel_height = -(max_lat - min_lat) / height  # Negative for north-up orientation
                 
                 # Create transform: pixel (0,0) maps to (min_lon, max_lat) = top-left corner
                 from rasterio.transform import Affine
@@ -141,7 +215,7 @@ class MLInferenceService:
                 print(f"   🗺️  Transform: |{transform.a:8.6f}, {transform.b:8.6f}, {transform.c:8.4f}|")
                 print(f"   🗺️            |{transform.d:8.6f}, {transform.e:8.6f}, {transform.f:8.4f}|")
                 print(f"   🗺️  Pixel size: {pixel_width:.6f}° lon × {abs(pixel_height):.6f}° lat")
-            else:
+            elif 'TILE_GEOREF' not in georef_env:
                 print(f"   ⚠️  No transform or bounds provided - polygons will be in pixel coordinates only")
 
             # Prepare binary npz payload to preserve dtype and reduce JSON drift
